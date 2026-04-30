@@ -1,8 +1,10 @@
 # Lattice: Argument-First Long-Form Writing Tool
 
-**Version:** 2.0
-**Status:** Build specification, not yet implemented
+**Version:** 2.0 (original spec) — implementation has moved beyond this; see [`../README.md`](../README.md) and the [Implementation deltas](#implementation-deltas) section below.
+**Status:** Build specification — implemented and extended.
 **Build target:** A Python CLI tool that turns an author-built argument structure, a folder of support materials, and a voice specification into polished long-form prose. The tool treats argument structure as authoritative, runs a parallel thesis-anchored review of the corpus to surface gaps and contradictions, and renders the working graph through swappable voices. The renderer operates at claim-cluster granularity to handle long-form documents (10,000+ words) reliably, and supports two editing modes: rewrite (regenerate from graph) and suggest-changes (surgical edits to existing prose).
+
+> **Live additions beyond this spec:** the working tool now ships a FastAPI web UI with WebSocket-streamed progress, an interactive cytoscape graph view, and an activity-oriented action model (Ingest · Scaffold · Draft · Find gaps · Refine · Restructure · Review). Section nesting goes 3 levels deep (`# A.` → `## A.1` → `### A.1.1`). New modules: `compare/` (cross-project), `lit_gaps/` (literature-gap analysis with OpenAlex verification), `restructure/` (advisory ordering audit), `review/` (supervisor track-changes). Read the README before reading this spec — the spec is canonical for the data model and the design intent, but several pipeline stages have been factored differently in code.
 
 **Why this exists:** Two earlier attempts at this problem failed in opposite directions. The first trusted the model to remember academic discipline and produced clean prose from loosely grounded evidence. The second forced evidence-first methodology but shipped structurally broken drafts. Lattice moves the discipline into the data model. Argument structure, claims, evidence, and voice are separate artifacts that compose deterministically into prose. Style is a projection function, not a constraint applied during generation.
 
@@ -886,6 +888,22 @@ Lattice v1 is done when David can:
 - Real-time shadow mapping as the author types
 - Automatic corpus discovery
 - Automatic Argus edge labelling on import (TUI only)
+
+---
+
+## Implementation deltas
+
+The implementation has moved past this spec in several places. For an up-to-date description of the runtime see [`../README.md`](../README.md). Highlights:
+
+- **Web UI** (FastAPI + WebSockets + cytoscape) replaces the originally-spec'd CLI/TUI as the primary surface; the CLI still works.
+- **Activity model**: the spec's `quick / standard / deep` review levels are gone. They've been replaced with seven verb-named entry points (`ingest`, `scaffold`, `draft`, `find_gaps`, `refine`, `restructure`, `review`), each independently runnable and re-runnable, with state-aware locking based on five filesystem-derived states (S0–S4).
+- **Nested sections (3 levels)**: `# A.` → `## A.1` → `### A.1.1`. The data model already supported `Section.parent`; the markdown ingester, assembler, hierarchy API, and graph viz now all honour it.
+- **Lit-gaps replaces "source-gap-vs-reference-doc"**: Find gaps now does per-section literature-gap analysis using Claude + OpenAlex verification, with no need for an external reference document. The original SourceGapReview module still exists but is unwired from the UI.
+- **Restructure**: new advisory module that audits section + cluster ordering against academic-writing rules, never mutates the graph.
+- **Review**: new supervisor-style review pipeline producing per-cluster word-level track-changes via `difflib`, per-section critiques, and an overall assessment.
+- **Compare**: cross-project structural diff + LLM-driven thesis comparison and claim pairing across two `author_graph.json` files.
+- **Per-section parallel relationship inference**: the original single-call inference was rewritten to chunk by section. A 51-section paper now gets 51 parallel calls and produces ~1-3 connections per claim instead of the previous hard-capped <0.3.
+- **Auto-outliner**: bumped truncation 24k → 100k chars; removed the "4-7 sections" cap; added subsection support; added a `max_depth` parameter the UI exposes as a Section-depth picker on Scaffold.
 
 ---
 

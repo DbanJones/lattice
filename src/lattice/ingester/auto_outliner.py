@@ -20,7 +20,14 @@ from pathlib import Path
 from typing import Protocol
 
 
-_HEADER_RE = re.compile(r"^\s*#\s+(THESIS|[A-Z]\.)", re.MULTILINE)
+# Top-level (``# A.``), nested subsection (``## A.1``,
+# ``### A.1.2``), or the THESIS marker. Any of these means the file
+# already contains a lattice outline and the auto-structurer should
+# leave it alone.
+_HEADER_RE = re.compile(
+    r"^\s*#+\s+(THESIS|[A-Z](?:\.\d+)*\.?)\s",
+    re.MULTILINE,
+)
 _BULLET_RE = re.compile(r"^(\s*-\s+.+?)(\s*)$", re.MULTILINE)
 _USER_SYNTHESIS_RE = re.compile(r"\[user_synthesis\]", re.IGNORECASE)
 _CONCLUSION_TAG_RE = re.compile(r"\[role\s*[:=]\s*conclusion\]", re.IGNORECASE)
@@ -105,7 +112,7 @@ class _LLMProtocol(Protocol):
     ): ...
 
 
-_SYSTEM_PROMPT = """You are converting raw academic paper prose into a Lattice outline.
+_SYSTEM_PROMPT_TEMPLATE = """You are converting raw academic paper prose into a Lattice outline.
 
 Lattice outlines have a strict, parser-friendly format. Every line and tag matters because a deterministic parser reads this file:
 
@@ -119,6 +126,15 @@ Lattice outlines have a strict, parser-friendly format. Every line and tag matte
       - [Claim 2.] [user_synthesis]
       - MY VIEW: [Author's analytical synthesis.] [user_synthesis]
 
+    ## A.1 [Subsection heading, only if the section has multiple distinct themes]
+
+      - [Sub-claim 1.] [user_synthesis]
+      - [Sub-claim 2.] [user_synthesis]
+
+    ### A.1.1 [Sub-subsection, only when warranted by depth of source material]
+
+      - [Deep claim.] [user_synthesis]
+
     # B. [Next section heading]
 
       - [Claim.] [user_synthesis]
@@ -129,43 +145,91 @@ Lattice outlines have a strict, parser-friendly format. Every line and tag matte
 
 Rules you MUST follow:
 1. Always begin with `# THESIS` followed by a blank line and exactly one sentence.
-2. Use `# A.`, `# B.`, `# C.`, ... for each subsequent section. The letter MUST be followed by a period and a space.
-3. Each claim is a `  - ` bullet (two spaces, a dash, a space) followed by the claim sentence and at least one tag in square brackets.
-4. **Tag EVERY claim with `[user_synthesis]`.** This signals that the claim is the author's own restating of the argument, which makes the claim renderable without external evidence bindings (we don't have a sources library yet for this project). Other tags (`[strong]`, `[empirical]`, etc.) require evidence bindings the project doesn't have, so they will fail to render.
-5. **The final section MUST be `# Z. Conclusion [role: conclusion]`** (use the next available letter and the literal tag `[role: conclusion]` — note the COLON, not equals). Lattice's voice template requires a closing section.
-6. Do NOT invent claims that aren't in the source. Stay faithful to what the source paper argues.
-7. Do NOT include source citations, references lists, figure captions, or author affiliations — only the argumentative spine.
-8. Section headings should be short (3-7 words). Aim for 4-7 sections total, including the conclusion.
-9. Output ONLY the markdown. No preamble, no explanation, no code fences.
+2. Top-level sections use `# A.`, `# B.`, `# C.`, ... — the letter MUST be followed by a period and a space.
+3. **{NESTING_RULE}**
+4. Each claim is a `  - ` bullet (two spaces, a dash, a space) followed by the claim sentence and at least one tag in square brackets.
+5. **Tag EVERY claim with `[user_synthesis]`.** This signals that the claim is the author's own restating of the argument, which makes the claim renderable without external evidence bindings. Other tags (`[strong]`, `[empirical]`, etc.) require evidence bindings the project may not have.
+6. **The final section MUST be `# Z. Conclusion [role: conclusion]`** (use the next available letter and the literal tag `[role: conclusion]` — note the COLON, not equals). Lattice's voice template requires a closing section.
+7. **Be thorough — extract every distinct claim the paper makes**, not just a high-level summary. A typical 10-30 page paper produces 40-100+ claims across its sections. Don't compress aggressively; the author can prune later.
+8. Let the source's structure dictate the breadth: papers with 8-10 distinct argumentative moves should produce 8-10 sections. Don't artificially cap section count.
+9. Do NOT invent claims that aren't in the source. Stay faithful to what the source argues.
+10. Do NOT include source citations, references lists, figure captions, or author affiliations — only the argumentative spine.
+11. Section headings should be short (3-7 words).
+12. Output ONLY the markdown. No preamble, no explanation, no code fences.
 """
 
 
+_NESTING_RULES = {
+    1: (
+        "Use a flat structure — top-level sections only (``# A.``, "
+        "``# B.``, ...). Do NOT use ``##`` or ``###`` subsection "
+        "headings. All claims for a section live directly under that "
+        "section's ``# X. Title`` heading."
+    ),
+    2: (
+        "Use nested subsections (``## A.1 Title``) whenever a top-level "
+        "section covers more than one distinct theme. A section that "
+        "ends up with more than ~6 claims almost always benefits from "
+        "being split into 2-3 subsections grouped by theme. Do NOT use "
+        "third-level ``###`` headings — keep nesting to two levels max."
+    ),
+    3: (
+        "Use nested subsections (``## A.1 Title``, ``### A.1.1 Title``) "
+        "whenever a top-level section covers more than one distinct "
+        "theme, and a subsection covers more than one sub-theme. A "
+        "section with >6 claims almost always benefits from being split "
+        "into 2-3 subsections; a subsection with >6 claims often "
+        "benefits from a further split."
+    ),
+}
+
+
+def _system_prompt(max_depth: int) -> str:
+    """Compose the system prompt with the right nesting rule for the
+    requested ``max_depth`` (1 = flat, 2 = subsections, 3 = sub-sub)."""
+    rule = _NESTING_RULES.get(max_depth, _NESTING_RULES[2])
+    return _SYSTEM_PROMPT_TEMPLATE.replace("{NESTING_RULE}", rule)
+
+
 def _user_prompt(prose: str) -> str:
-    # Truncate aggressively if the document is huge — first ~24k chars
-    # is normally enough to capture the abstract + introduction +
-    # methods + first results, which is where the thesis and section
-    # structure live.
+    # Send up to 100k chars (~25k tokens) so Claude sees the whole paper
+    # for typical academic-length documents. Earlier 24k cap forced
+    # Claude to summarise from the abstract + intro alone, missing
+    # claims from later sections. The model handles 200k+ token context
+    # comfortably; this is only truncated for genuinely huge inputs.
     trimmed = prose.strip()
-    if len(trimmed) > 24000:
-        trimmed = trimmed[:24000] + "\n\n[...document truncated for length...]"
+    if len(trimmed) > 100_000:
+        trimmed = trimmed[:100_000] + "\n\n[...document truncated for length...]"
     return (
         "Convert the following raw paper text into a Lattice outline. "
-        "Extract the central thesis, the major sections, and the key "
-        "claims under each section.\n\n"
+        "Extract the central thesis, every distinct argumentative "
+        "section, and every claim made in each section. Use nested "
+        "subsections (``## A.1``, ``### A.1.1``) when a section "
+        "covers more than one theme. Be thorough — don't summarise "
+        "to a sketch.\n\n"
         "---BEGIN PAPER---\n"
         f"{trimmed}\n"
         "---END PAPER---\n"
     )
 
 
-async def structure_outline(prose: str, llm: _LLMProtocol) -> str:
+async def structure_outline(
+    prose: str,
+    llm: _LLMProtocol,
+    max_depth: int = 2,
+) -> str:
     """Ask Claude to convert raw paper prose into a lattice outline.
+
+    ``max_depth`` controls how deep the section tree is allowed to go:
+      1 = flat, ``# A.`` only
+      2 = subsections, ``# A.`` + ``## A.1`` (default)
+      3 = sub-sub, also allows ``### A.1.1``
 
     Returns the structured markdown. Raises ``RuntimeError`` if the
     model output doesn't look like a lattice outline (defensive — we'd
     rather fail loudly than save garbage to disk)."""
     response = await llm.complete(
-        system=_SYSTEM_PROMPT,
+        system=_system_prompt(max_depth),
         user=_user_prompt(prose),
     )
     structured = (response.text or "").strip()

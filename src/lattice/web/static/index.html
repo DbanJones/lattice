@@ -39,6 +39,7 @@
           <p class="lede">Each project is a folder under <code class="path-pill" data-bind="root"></code>. Pick one to review its hierarchy, drafts, and outputs.</p>
         </div>
         <div class="page-actions">
+          <button class="btn" data-action="compare-projects">⇄ Compare</button>
           <button class="btn primary" data-action="new-project">+ New project</button>
         </div>
       </div>
@@ -162,104 +163,81 @@
       <div class="status-strip" data-bind="status-strip"></div>
       <nav class="subnav">
         <button class="subnav-tab active" data-section="dashboard">Dashboard</button>
-        <button class="subnav-tab" data-section="outline">Outline</button>
+        <button class="subnav-tab" data-section="activities">Activities</button>
         <button class="subnav-tab" data-section="sources">Sources</button>
-        <button class="subnav-tab" data-section="references">References</button>
-        <button class="subnav-tab" data-section="review">Review</button>
+        <button class="subnav-tab" data-section="output">Output</button>
       </nav>
       <div class="subnav-body">
-        <section class="subnav-panel visible" data-panel="dashboard" data-bind="dashboard"></section>
-        <section class="subnav-panel" data-panel="outline" data-bind="outline"></section>
-        <section class="subnav-panel" data-panel="sources" data-bind="sources"></section>
-        <section class="subnav-panel" data-panel="references" data-bind="references"></section>
-        <section class="subnav-panel" data-panel="review" data-bind="review"></section>
+        <section class="subnav-panel visible" data-panel="dashboard" data-bind="dashboard-panel"></section>
+        <section class="subnav-panel" data-panel="activities" data-bind="activities-panel"></section>
+        <section class="subnav-panel" data-panel="sources" data-bind="sources-panel"></section>
+        <section class="subnav-panel" data-panel="output" data-bind="output-panel"></section>
       </div>
     </div>
   </template>
 
-  <template id="tpl-run-form">
-    <div class="run-wrapper">
-    <form class="run-form">
-      <div class="card">
-        <h3>Review level</h3>
-        <p class="muted small">Each level adds more checks. Quick is fastest; deep includes the convergence loop and an optional source-gap review against a reference document.</p>
-        <div class="level-options">
-          <label class="level-option">
-            <input type="radio" name="level" value="quick" />
-            <div class="level-card">
-              <div class="level-head">
-                <span class="level-name">Quick</span>
-                <span class="level-time">~5 min</span>
-              </div>
-              <p class="level-desc">Render only.</p>
-              <div class="level-features"><span>Render</span></div>
-            </div>
-          </label>
-          <label class="level-option">
-            <input type="radio" name="level" value="standard" checked />
-            <div class="level-card">
-              <div class="level-head">
-                <span class="level-name">Standard</span>
-                <span class="level-time">~15 min</span>
-              </div>
-              <p class="level-desc">Render plus full audit and voice review. No autocorrect.</p>
-              <div class="level-features"><span>Render</span><span>Audit</span><span>Voice review</span></div>
-            </div>
-          </label>
-          <label class="level-option">
-            <input type="radio" name="level" value="deep" />
-            <div class="level-card">
-              <div class="level-head">
-                <span class="level-name">Deep</span>
-                <span class="level-time">~45 min</span>
-              </div>
-              <p class="level-desc">Convergence loop with autocorrect aggressive plus source-gap review against a reference document.</p>
-              <div class="level-features"><span>Render</span><span>Audit</span><span>Autocorrect</span><span>Source-gap</span><span>Voice review</span></div>
-            </div>
-          </label>
-        </div>
+  <template id="tpl-activity-launcher">
+    <div class="activities-wrapper">
+      <div class="state-banner" data-bind="state-banner"></div>
+      <div class="activity-grid" data-bind="cards"></div>
+      <div class="activity-progress hidden" data-bind="progress"></div>
+      <div class="activity-history" data-bind="history"></div>
+    </div>
+  </template>
+
+  <template id="tpl-activity-card">
+    <button class="activity-card" data-bind="card">
+      <div class="activity-card-head">
+        <span class="activity-icon" data-bind="icon"></span>
+        <span class="activity-name" data-bind="name"></span>
+        <span class="activity-state" data-bind="state-pill"></span>
       </div>
+      <p class="activity-summary" data-bind="summary"></p>
+      <p class="activity-meta muted small" data-bind="meta"></p>
+    </button>
+  </template>
 
-      <details class="card advanced">
-        <summary>Advanced options</summary>
-        <div class="form-grid">
-          <label class="field">
-            <span class="field-label">Voice</span>
-            <select name="voice" data-bind="voice-select"></select>
-          </label>
-          <label class="field">
-            <span class="field-label">Reference document <span class="muted small">(deep only)</span></span>
-            <input type="text" name="reference_path" placeholder="absolute path to reference markdown" />
-          </label>
-          <label class="field">
-            <span class="field-label">Max passes</span>
-            <input type="number" name="max_passes" value="3" min="1" max="6" />
-          </label>
-          <label class="field">
-            <span class="field-label">Chunk min</span>
-            <input type="number" name="chunk_min" value="3" min="1" max="10" />
-          </label>
-          <label class="field">
-            <span class="field-label">Chunk max</span>
-            <input type="number" name="chunk_max" value="4" min="1" max="20" />
-          </label>
-          <label class="field-check">
-            <input type="checkbox" name="force" />
-            <span>Force re-render every cluster</span>
-          </label>
+  <template id="tpl-activity-sheet">
+    <div class="modal-backdrop">
+      <div class="modal sheet">
+        <div class="modal-head">
+          <h2 data-bind="title"></h2>
+          <button class="btn-ghost" data-action="close">✕</button>
         </div>
-      </details>
+        <p class="muted small sheet-lede" data-bind="lede"></p>
+        <form class="modal-body sheet-form" data-bind="form">
+          <div class="sheet-fields" data-bind="fields"></div>
 
-      <div class="run-actions">
-        <button type="submit" class="btn primary lg">Start review</button>
-        <span class="muted small">Pipeline runs locally against your Claude Code subscription.</span>
+          <div class="field">
+            <span class="field-label">Thoroughness</span>
+            <div class="mode-toggle">
+              <label class="mode-option">
+                <input type="radio" name="mode" value="fast" />
+                <span>Fast</span>
+              </label>
+              <label class="mode-option">
+                <input type="radio" name="mode" value="thorough" checked />
+                <span>Thorough</span>
+              </label>
+            </div>
+            <span class="muted small" data-bind="mode-hint"></span>
+          </div>
+
+          <div class="modal-actions">
+            <button type="button" class="btn" data-action="close">Cancel</button>
+            <button type="submit" class="btn primary" data-bind="submit">Start</button>
+          </div>
+          <p class="modal-error muted small" data-bind="error"></p>
+        </form>
       </div>
-    </form>
+    </div>
+  </template>
 
+  <template id="tpl-activity-progress">
     <div class="run-status hidden" data-bind="status">
       <div class="card status-card">
         <div class="status-head">
-          <h3>Live progress</h3>
+          <h3 data-bind="title">Live progress</h3>
           <div class="status-pills">
             <span class="pill mono" data-bind="run-id"></span>
             <span class="pill mono" data-bind="pass">Pass 1</span>
@@ -271,6 +249,69 @@
         <div class="run-summary hidden" data-bind="summary"></div>
       </div>
     </div>
+  </template>
+
+  <template id="tpl-compare-modal">
+    <div class="modal-backdrop">
+      <div class="modal">
+        <div class="modal-head">
+          <h2>Compare two scaffolds</h2>
+          <button class="btn-ghost" data-action="close">✕</button>
+        </div>
+        <form class="modal-body" data-bind="form">
+          <div class="compare-pickers">
+            <label class="field">
+              <span class="field-label">Project A</span>
+              <select name="project_a" data-bind="select-a"></select>
+            </label>
+            <span class="compare-arrow">⇄</span>
+            <label class="field">
+              <span class="field-label">Project B</span>
+              <select name="project_b" data-bind="select-b"></select>
+            </label>
+          </div>
+          <div class="field">
+            <span class="field-label">Mode</span>
+            <div class="mode-toggle">
+              <label class="mode-option">
+                <input type="radio" name="mode" value="fast" />
+                <span>Fast (structural only)</span>
+              </label>
+              <label class="mode-option">
+                <input type="radio" name="mode" value="thorough" checked />
+                <span>Thorough (LLM semantic pairing)</span>
+              </label>
+            </div>
+            <span class="muted small">Thorough mode calls Claude to pair claims that express the same idea in different words.</span>
+          </div>
+          <div class="modal-actions">
+            <button type="button" class="btn" data-action="close">Cancel</button>
+            <button type="submit" class="btn primary">Compare →</button>
+          </div>
+          <p class="modal-error muted small" data-bind="error"></p>
+        </form>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-compare-results">
+    <div class="container compare-results">
+      <div class="page-head">
+        <div>
+          <h1 data-bind="title">Compare</h1>
+          <p class="lede" data-bind="subtitle"></p>
+        </div>
+        <div class="page-actions">
+          <button class="btn" data-action="back">← Back</button>
+        </div>
+      </div>
+      <div class="compare-summary card" data-bind="summary"></div>
+      <div class="compare-thesis card" data-bind="thesis"></div>
+      <div class="compare-pairs card" data-bind="pairs"></div>
+      <div class="compare-unique-grid">
+        <div class="card" data-bind="unique-a"></div>
+        <div class="card" data-bind="unique-b"></div>
+      </div>
     </div>
   </template>
 

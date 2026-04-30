@@ -4,4 +4,4 @@ See docs/SPEC.md for the canonical specification.
 See docs/HANDOFF.md for the build order.
 """
 
-__version__ = "0.7.9"
+__version__ = "0.8.1"

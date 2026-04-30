@@ -44,9 +44,7 @@ _VALID_STRENGTHS = {s.value for s in RelationshipStrength}
 
 _SYSTEM_PROMPT = """You analyse the argument structure of an academic outline and propose relationships between claims.
 
-You receive a JSON document listing every section and every claim in a paper. Each claim has a stable id (e.g. `cl.a.1`, `cl.b.3`).
-
-Your job: identify pairs of claims where one is in a recognisable analytical relationship to another, and emit a JSON array of these relationships.
+You receive one focused section of a paper plus its sibling-section context, and emit a JSON array of relationships involving the claims in that focused section.
 
 Available relationship types (be conservative — only emit a type when the relationship is clear):
 - `supports`         — claim A provides evidence or reasoning that strengthens claim B
@@ -66,15 +64,16 @@ Available strengths:
 
 Output rules:
 1. Output ONLY a JSON array. No prose, no fences.
-2. Each entry: `{"from": "cl.x.y", "to": "cl.x.z", "type": "<one of above>", "strength": "<direct|partial|inferred>", "note": "<one short sentence explaining the link>"}`
+2. Each entry: `{"from": "cl.x.y", "to": "cl.x.z", "type": "<one of above>", "strength": "<direct|partial|inferred>", "note": "<one short sentence>"}`
 3. Do not invent claim ids — only use ids that appear in the input.
 4. Do not emit self-relationships (`from` == `to`).
-5. Aim for the strongest 10-30 relationships across the paper, prioritising:
-   - claims that support the thesis claim
-   - the thesis claim's relationships to section conclusions
-   - sequential claims within a section that build on each other
-   - cross-section claims that bear on the same argumentative thread
-6. If two claims merely sit next to each other without a clear analytical link, do not emit a relationship.
+5. **Density target: most claims should appear at least once as `from` or `to`.** A typical academic paragraph claim has 1-3 analytical neighbours (the previous claim it builds on, the next claim it sets up, an external claim it supports/contradicts). Don't pad with weak links, but don't artificially under-report either.
+6. Prioritise:
+   - sequential claims inside this section that build on each other
+   - claims in this section that support / extend / qualify the thesis
+   - cross-section links: claims here that connect to the listed sibling sections
+   - the section's concluding / synthesis claims linking back to its setup claims
+7. If two claims merely sit next to each other without a clear analytical link, do not emit a relationship.
 
 Example output:
 [
@@ -84,29 +83,64 @@ Example output:
 """
 
 
-def _build_user_prompt(graph: AuthorGraph) -> str:
-    sections_dump: list[dict[str, Any]] = []
+def _build_section_prompt(
+    graph: AuthorGraph,
+    focus_section_id: str,
+) -> str:
+    """Compact prompt: full focus-section claims + sibling-section
+    summaries (titles + claim ids only) so cross-section links remain
+    addressable without ballooning the prompt."""
     claims_by_id = {c.claim_id: c for c in graph.claims}
-    for section in graph.sections:
-        sections_dump.append({
-            "section_id": section.section_id,
-            "title": section.title,
-            "role": section.role.value if hasattr(section.role, "value") else str(section.role),
+    sections_by_id = {s.section_id: s for s in graph.sections}
+
+    focus = sections_by_id.get(focus_section_id)
+    if focus is None:
+        return ""
+
+    focus_claims = [
+        {
+            "claim_id": cid,
+            "statement": claims_by_id[cid].statement if cid in claims_by_id else "",
+        }
+        for cid in focus.claim_ids
+    ]
+
+    # Sibling sections: titles + claim ids + first 80 chars of each
+    # claim. Enough for the LLM to reach cross-section, without sending
+    # the full text of every other section's claims.
+    siblings: list[dict[str, Any]] = []
+    for s in graph.sections:
+        if s.section_id == focus_section_id:
+            continue
+        siblings.append({
+            "section_id": s.section_id,
+            "title": s.title,
             "claims": [
                 {
                     "claim_id": cid,
-                    "statement": claims_by_id[cid].statement if cid in claims_by_id else "",
+                    "statement": (
+                        claims_by_id[cid].statement[:120]
+                        if cid in claims_by_id else ""
+                    ),
                 }
-                for cid in section.claim_ids
+                for cid in s.claim_ids
             ],
         })
+
     payload = {
         "thesis_statement": graph.thesis_statement,
-        "sections": sections_dump,
+        "focus_section": {
+            "section_id": focus.section_id,
+            "title": focus.title,
+            "role": focus.role.value if hasattr(focus.role, "value") else str(focus.role),
+            "claims": focus_claims,
+        },
+        "sibling_sections": siblings,
     }
     return (
-        "Analyse the following outline and propose relationships between "
-        "the claims. Output a single JSON array.\n\n"
+        "Propose relationships involving claims in the FOCUS section. "
+        "You may also link them to claims in sibling sections when there "
+        "is a clear analytical connection. Output a single JSON array.\n\n"
         f"{json.dumps(payload, indent=2)}"
     )
 
@@ -114,59 +148,85 @@ def _build_user_prompt(graph: AuthorGraph) -> str:
 async def infer_relationships(
     graph: AuthorGraph, llm: _LLMProtocol
 ) -> list[Relationship]:
-    """Ask Claude to propose relationships, parse the JSON response,
-    and return a list of valid ``Relationship`` objects.
+    """Ask Claude to propose relationships per-section in parallel,
+    then merge into a deduplicated list.
 
-    Invalid entries (unknown ids, unknown types) are silently dropped
-    rather than failing the whole call — the LLM occasionally
-    hallucinates a single bad row, and we'd rather keep the good ones.
+    Per-section chunking gives each section its own output budget so
+    a 300-claim paper isn't squeezed into one ~30-relationship response.
+    Invalid entries (unknown ids, unknown types) are silently dropped.
     """
     if not graph.claims:
         return []
 
-    data, _response = await llm.complete_json(
-        system=_SYSTEM_PROMPT,
-        user=_build_user_prompt(graph),
-    )
-    if not isinstance(data, list):
-        return []
+    import asyncio as _asyncio
 
     valid_ids = {c.claim_id for c in graph.claims}
     now = datetime.now(timezone.utc)
+
+    # Skip sections with no claims and reference-only sections.
+    eligible_sections = [
+        s for s in graph.sections
+        if s.claim_ids
+        and s.section_id != "s.thesis"
+        and (
+            s.role.value if hasattr(s.role, "value") else str(s.role)
+        ) != "references"
+    ]
+    if not eligible_sections:
+        return []
+
+    async def per_section(section_id: str) -> list[dict[str, Any]]:
+        prompt = _build_section_prompt(graph, section_id)
+        if not prompt:
+            return []
+        try:
+            data, _ = await llm.complete_json(
+                system=_SYSTEM_PROMPT,
+                user=prompt,
+            )
+        except Exception:
+            return []
+        return data if isinstance(data, list) else []
+
+    batches = await _asyncio.gather(
+        *[per_section(s.section_id) for s in eligible_sections]
+    )
+
     relationships: list[Relationship] = []
     seen: set[tuple[str, str, str]] = set()
-    for i, row in enumerate(data):
-        if not isinstance(row, dict):
-            continue
-        from_id = row.get("from")
-        to_id = row.get("to")
-        rtype = row.get("type", "unlabelled")
-        rstrength = row.get("strength", "inferred")
-        note = (row.get("note") or "").strip()
-        if not isinstance(from_id, str) or not isinstance(to_id, str):
-            continue
-        if from_id not in valid_ids or to_id not in valid_ids:
-            continue
-        if from_id == to_id:
-            continue
-        if rtype not in _VALID_TYPES:
-            rtype = "unlabelled"
-        if rstrength not in _VALID_STRENGTHS:
-            rstrength = "inferred"
-        key = (from_id, to_id, rtype)
-        if key in seen:
-            continue
-        seen.add(key)
-        relationships.append(Relationship(
-            rel_id=f"rel.inferred.{len(relationships) + 1}",
-            type=RelationshipType(rtype),
-            **{"from": from_id},
-            to=to_id,
-            strength=RelationshipStrength(rstrength),
-            note=note[:280],
-            created_by="relationship_inference",
-            created_at=now,
-        ))
+    for batch in batches:
+        for row in batch:
+            if not isinstance(row, dict):
+                continue
+            from_id = row.get("from")
+            to_id = row.get("to")
+            rtype = row.get("type", "unlabelled")
+            rstrength = row.get("strength", "inferred")
+            note = (row.get("note") or "").strip()
+            if not isinstance(from_id, str) or not isinstance(to_id, str):
+                continue
+            if from_id not in valid_ids or to_id not in valid_ids:
+                continue
+            if from_id == to_id:
+                continue
+            if rtype not in _VALID_TYPES:
+                rtype = "unlabelled"
+            if rstrength not in _VALID_STRENGTHS:
+                rstrength = "inferred"
+            key = (from_id, to_id, rtype)
+            if key in seen:
+                continue
+            seen.add(key)
+            relationships.append(Relationship(
+                rel_id=f"rel.inferred.{len(relationships) + 1}",
+                type=RelationshipType(rtype),
+                **{"from": from_id},
+                to=to_id,
+                strength=RelationshipStrength(rstrength),
+                note=note[:280],
+                created_by="relationship_inference",
+                created_at=now,
+            ))
     return relationships
 
 

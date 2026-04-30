@@ -274,13 +274,31 @@ def render_html(graph: AuthorGraph) -> str:
     sections_legend: list[dict] = []
 
     # Map section_id -> color for claim coloring + legend.
+    # Subsections inherit their top-level ancestor's colour so all of
+    # ``s.c``'s claims (including those in ``s.c.1``, ``s.c.1.2``)
+    # paint as one family — keeps the graph readable when a paper has
+    # three levels of nesting.
     renderable_sections = [
         s for s in graph.sections
         if s.role != SectionRole.references and s.section_id != "s.thesis"
     ]
-    section_colors = {
+    top_level = [s for s in renderable_sections if not s.parent]
+    top_colors = {
         s.section_id: _SECTION_PALETTE[i % len(_SECTION_PALETTE)]
-        for i, s in enumerate(renderable_sections)
+        for i, s in enumerate(top_level)
+    }
+
+    def _top_ancestor_id(sid: str) -> str:
+        # Walk up via the parent map until we hit a section with no parent.
+        by_id = {s.section_id: s for s in graph.sections}
+        cur = by_id.get(sid)
+        while cur is not None and cur.parent:
+            cur = by_id.get(cur.parent)
+        return cur.section_id if cur else sid
+
+    section_colors = {
+        s.section_id: top_colors.get(_top_ancestor_id(s.section_id), _SECTION_PALETTE[0])
+        for s in renderable_sections
     }
 
     # Thesis node first (always at the top of the layout). Prefer the
@@ -311,11 +329,20 @@ def render_html(graph: AuthorGraph) -> str:
         })
 
     for section in renderable_sections:
+        # Section depth is encoded in the section_id (``s.c`` = 0,
+        # ``s.c.1`` = 1, ``s.c.1.2`` = 2). The legend uses depth to
+        # indent subsection entries so the reader can see the nesting.
+        depth = (
+            0 if section.section_id == "s.thesis"
+            else max(0, section.section_id.count(".") - 1)
+        )
         sections_legend.append({
             "id": section.section_id,
+            "parent": section.parent,
             "title": section.title,
             "color": section_colors[section.section_id],
             "claimCount": len(section.claim_ids),
+            "depth": depth,
         })
         for cid in section.claim_ids:
             claim = next((c for c in graph.claims if c.claim_id == cid), None)
@@ -444,13 +471,29 @@ _HTML_TEMPLATE = """<!doctype html>
   }
   #sidebar h4 { margin: 14px 0 6px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
   #sidebar h4:first-child { margin-top: 0; }
-  .legend-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; cursor: default; }
+  .legend-row {
+    display: flex; align-items: center; gap: 8px; padding: 5px 6px;
+    cursor: pointer; border-radius: 4px;
+    transition: background 0.12s;
+  }
+  .legend-row:hover { background: rgba(59, 130, 246, 0.08); }
+  .legend-row.selected {
+    background: rgba(59, 130, 246, 0.18);
+    box-shadow: inset 2px 0 0 #3b82f6;
+  }
   .legend-swatch { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
   .legend-text { flex: 1; line-height: 1.4; font-size: 12px; }
   .legend-count {
     color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums;
     background: var(--bg); padding: 1px 6px; border-radius: 99px;
   }
+  #section-legend-clear {
+    display: none; margin-top: 6px; padding: 4px 8px;
+    font-size: 11px; color: var(--accent);
+    background: transparent; border: 1px dashed var(--border);
+    border-radius: 4px; cursor: pointer; width: 100%;
+  }
+  #section-legend-clear.visible { display: block; }
   #info {
     padding: 12px; background: var(--surface); border: 1px solid var(--border);
     border-radius: 6px; margin-bottom: 14px; min-height: 60px;
@@ -498,6 +541,7 @@ _HTML_TEMPLATE = """<!doctype html>
     <div id="info" class="empty">Hover a node to highlight its neighbours · click for detail.</div>
     <h4>Sections</h4>
     <div id="section-legend"></div>
+    <button id="section-legend-clear" type="button">clear section filter</button>
     <h4>Edges</h4>
     <div class="edge-legend supports"><span class="swatch"></span> supports</div>
     <div class="edge-legend contradicts"><span class="swatch"></span> contradicts</div>
@@ -517,18 +561,90 @@ _HTML_TEMPLATE = """<!doctype html>
 <script>
 const data = __ELEMENTS__;
 
-// Render section legend.
+// Render section legend. Subsection rows indent by depth so the
+// hierarchy reads as a tree. Each row is clickable: clicking a section
+// applies a sticky highlight to all of that section's claims (and any
+// descendant subsection's claims), dimming everything else. Clicking
+// the same row again clears.
 const legendEl = document.getElementById('section-legend');
+
+// Build descendants map so clicking a parent section also highlights
+// claims in its subsections.
+const descendantsById = {};
+data.sections.forEach(s => { descendantsById[s.id] = new Set([s.id]); });
+data.sections.forEach(s => {
+  let p = s.parent;
+  while (p) {
+    if (descendantsById[p]) descendantsById[p].add(s.id);
+    const parentRow = data.sections.find(x => x.id === p);
+    p = parentRow ? parentRow.parent : null;
+  }
+});
+
+let sectionFilterActive = null;  // section_id of the currently-pinned filter
+
+function applySectionFilter(sectionId) {
+  if (sectionFilterActive === sectionId) {
+    clearSectionFilter();
+    return;
+  }
+  sectionFilterActive = sectionId;
+  const validIds = descendantsById[sectionId] || new Set([sectionId]);
+  cy.batch(() => {
+    cy.nodes().forEach(n => {
+      const sid = n.data('sectionId');
+      if (validIds.has(sid)) {
+        n.removeClass('dimmed').addClass('highlight');
+      } else {
+        n.removeClass('highlight').addClass('dimmed');
+      }
+    });
+    cy.edges().forEach(e => {
+      const src = e.source().data('sectionId');
+      const tgt = e.target().data('sectionId');
+      // Edge is fully visible only when BOTH endpoints are inside the
+      // selected section family — keeps the highlight focused on
+      // intra-family argumentation.
+      if (validIds.has(src) && validIds.has(tgt)) {
+        e.removeClass('dimmed').addClass('highlight');
+      } else {
+        e.removeClass('highlight').addClass('dimmed');
+      }
+    });
+  });
+  legendEl.querySelectorAll('.legend-row').forEach(r =>
+    r.classList.toggle('selected', r.dataset.sectionId === sectionId));
+  document.getElementById('section-legend-clear').classList.add('visible');
+}
+
+function clearSectionFilter() {
+  sectionFilterActive = null;
+  cy.batch(() => {
+    cy.nodes().removeClass('dimmed highlight');
+    cy.edges().removeClass('dimmed highlight');
+  });
+  legendEl.querySelectorAll('.legend-row').forEach(r =>
+    r.classList.remove('selected'));
+  document.getElementById('section-legend-clear').classList.remove('visible');
+}
+
 data.sections.forEach(s => {
   const row = document.createElement('div');
   row.className = 'legend-row';
+  row.dataset.sectionId = s.id;
+  const indent = (s.depth || 0) * 12;
+  row.style.paddingLeft = (6 + indent) + 'px';
   row.innerHTML = `
     <span class="legend-swatch" style="background:${s.color}"></span>
     <span class="legend-text">${s.title}</span>
     <span class="legend-count">${s.claimCount}</span>
   `;
+  row.addEventListener('click', () => applySectionFilter(s.id));
   legendEl.appendChild(row);
 });
+
+document.getElementById('section-legend-clear')
+  .addEventListener('click', clearSectionFilter);
 
 const cy = cytoscape({
   container: document.getElementById('cy'),
@@ -673,17 +789,22 @@ document.getElementById('fit-btn').addEventListener('click', () => cy.fit(undefi
 document.getElementById('relayout-btn').addEventListener('click', () => applyLayout(document.getElementById('layout-picker').value));
 
 // ── Hover: dim non-neighbour nodes/edges so the connectivity of the
-// hovered claim becomes visually obvious.
+// hovered claim becomes visually obvious. When a sticky section
+// filter is active (sectionFilterActive != null), skip the transient
+// hover dim/restore so we don't clobber the pinned highlight.
 cy.on('mouseover', 'node', evt => {
+  if (sectionFilterActive !== null) return;
   const node = evt.target;
   const neighbourhood = node.closedNeighborhood();
   cy.elements().not(neighbourhood).addClass('dimmed');
   neighbourhood.removeClass('dimmed').addClass('highlight');
 });
 cy.on('mouseout', 'node', () => {
+  if (sectionFilterActive !== null) return;
   cy.elements().removeClass('dimmed').removeClass('highlight');
 });
 cy.on('mouseover', 'edge', evt => {
+  if (sectionFilterActive !== null) return;
   const edge = evt.target;
   const ends = edge.connectedNodes();
   cy.elements().not(edge.union(ends)).addClass('dimmed');
@@ -691,6 +812,7 @@ cy.on('mouseover', 'edge', evt => {
   ends.addClass('highlight');
 });
 cy.on('mouseout', 'edge', () => {
+  if (sectionFilterActive !== null) return;
   cy.elements().removeClass('dimmed').removeClass('highlight');
 });
 

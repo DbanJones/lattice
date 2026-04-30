@@ -112,6 +112,8 @@ async function renderProjectsList() {
 
   main.querySelector('[data-action="new-project"]')
     .addEventListener("click", openNewProjectModal);
+  main.querySelector('[data-action="compare-projects"]')
+    .addEventListener("click", () => openCompareModal(state.projects || []));
 
   // Insert a "+ New category" button next to "+ New project".
   const actions = main.querySelector('.page-actions');
@@ -783,18 +785,18 @@ async function renderProjectDetail(name, sectionId, subSectionId) {
   main.querySelector('[data-bind="thesis"]').textContent =
     detail.thesis_statement ? truncate(detail.thesis_statement, 220) : "No thesis statement.";
 
-  // Header actions: rename + the primary CTA that routes to Review.
+  // Header actions: rename + Full Review (split button — primary
+  // runs the saved selection; the caret opens a popover where the
+  // user toggles which activities to include and picks a mode).
   const headerActions = main.querySelector('[data-bind="header-actions"]');
   headerActions.innerHTML = `
     <button class="btn" data-action="rename-project" title="Rename project or folder">Rename</button>
-    <button class="btn primary" data-action="goto-review">Start review →</button>
+    ${buildFullReviewControlsHtml()}
   `;
-  headerActions.querySelector('[data-action="goto-review"]').addEventListener("click", () => {
-    navigate(`/p/${encodeURIComponent(name)}/review`);
-  });
   headerActions.querySelector('[data-action="rename-project"]').addEventListener("click", () => {
     renameProjectPrompt({name, display_name: detail.display_name || name});
   });
+  wireFullReviewControls(headerActions, name);
 
   // Status strip: at-a-glance pipeline progression so the header
   // always shows where the project is. Each pip is now a clickable
@@ -815,24 +817,27 @@ async function renderProjectDetail(name, sectionId, subSectionId) {
     p.classList.toggle("visible", p.dataset.panel === sectionId);
   });
 
-  // Render the active section's body. Tab IDs were consolidated:
-  //   - "hierarchy" → "outline"  (more user-friendly term)
-  //   - "audit" + "reviews" → "quality"  (one place for QA artefacts)
-  //   - "run" → "review"  (the action surface)
+  // Subnav: four tabs, each with its own sub-tabs underneath
+  // (matching the Output pattern for visual consistency).
   switch (sectionId) {
-    case "dashboard":  renderDashboard(main); break;
-    case "outline":    renderHierarchy(main); break;
-    case "sources":    renderSources(main); break;
-    case "references": renderReferences(main); break;
-    case "review":     renderRunPanel(main, subSectionId); break;
-    // Legacy URLs gracefully redirect to the new structure.
-    case "overview":  navigate(`/p/${encodeURIComponent(state.current)}/dashboard`); break;
-    case "drafts":    navigate(`/p/${encodeURIComponent(state.current)}/dashboard`); break;
-    case "quality":   navigate(`/p/${encodeURIComponent(state.current)}/review`); break;
-    case "hierarchy": navigate(`/p/${encodeURIComponent(state.current)}/outline`); break;
+    case "dashboard":  renderDashboardTab(main, subSectionId); break;
+    case "activities": renderActivitiesTab(main, subSectionId); break;
+    case "sources":    renderSourcesTab(main, subSectionId); break;
+    case "output":     renderOutputTab(main, subSectionId); break;
+    // Legacy URLs gracefully redirect.
+    case "overview":
+    case "drafts":     navigate(`/p/${encodeURIComponent(state.current)}/dashboard`); break;
+    case "review":
+    case "run":        navigate(`/p/${encodeURIComponent(state.current)}/activities`); break;
+    case "outline":
+    case "hierarchy":  navigate(`/p/${encodeURIComponent(state.current)}/sources/outline`); break;
+    case "references": navigate(`/p/${encodeURIComponent(state.current)}/sources/references`); break;
     case "audit":
-    case "reviews":   navigate(`/p/${encodeURIComponent(state.current)}/review`); break;
-    case "run":       navigate(`/p/${encodeURIComponent(state.current)}/review`); break;
+    case "voice":
+    case "gap":
+    case "changelog":
+    case "quality":
+    case "reviews":    navigate(`/p/${encodeURIComponent(state.current)}/output`); break;
   }
 }
 
@@ -1518,8 +1523,9 @@ function renderHierarchy(main) {
     return;
   }
 
-  // Toolbar: switch between tree view and interactive graph view.
-  // Also: expand-all / collapse-all + export-to-PPTX.
+  // Toolbar: stats + tree-control buttons. The interactive graph
+  // lives in its own sub-tab now (Sources → Graph), so the Tree/Graph
+  // toggle that used to be here is gone.
   const projSlug = encodeURIComponent(state.current);
   const toolbarHtml = `
     <div class="graph-viz-toolbar">
@@ -1530,15 +1536,27 @@ function renderHierarchy(main) {
         <strong>${h.totals.relationships}</strong> relationships
       </div>
       <div style="display: flex; gap: 6px; flex-wrap: wrap;">
-        <button class="btn sm active" data-view="tree">Tree view</button>
-        <button class="btn sm" data-view="graph">Interactive graph</button>
         <button class="btn sm" data-action="expand-all">Expand all</button>
         <button class="btn sm" data-action="collapse-all">Collapse all</button>
         <a class="btn sm" href="/api/projects/${projSlug}/export/teaching-deck" download>Export to PowerPoint</a>
       </div>
     </div>`;
 
-  const sectionsHtml = h.sections.map(s => {
+  // Build a parent -> children map so nested sections render under
+  // their parent. Sections without a parent are top-level. The order
+  // within siblings respects ``position``.
+  const childrenByParent = new Map();
+  h.sections.forEach(s => {
+    const key = s.parent || "__root__";
+    if (!childrenByParent.has(key)) childrenByParent.set(key, []);
+    childrenByParent.get(key).push(s);
+  });
+  for (const list of childrenByParent.values()) {
+    list.sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+  }
+
+  function renderSectionNode(s) {
+    const depth = s.depth ?? 0;
     const clustersHtml = s.clusters.map(c => {
       const claimsHtml = c.claims.map(cl => renderClaimNode(cl)).join("");
       return `
@@ -1552,24 +1570,32 @@ function renderHierarchy(main) {
         </div>`;
     }).join("");
 
+    const childSections = (childrenByParent.get(s.section_id) || []);
+    const childSectionsHtml = childSections.map(renderSectionNode).join("");
+
     return `
-      <div class="tree-section collapsed">
+      <div class="tree-section depth-${depth} ${depth === 0 ? "" : "collapsed"}" data-section-id="${escapeAttr(s.section_id)}">
         <div class="tree-section-head" data-toggle="section">
           <svg class="chevron" width="14" height="14" viewBox="0 0 12 12"><path d="M3 4 L6 8 L9 4" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
           <span class="tree-section-title">${escapeHtml(s.title || s.section_id)}</span>
           <div class="tree-section-meta">
             <span class="pill">${escapeHtml(s.role || "argumentative")}</span>
-            <span class="pill mono">${s.clusters.length} clusters</span>
+            <span class="pill mono">${s.clusters.length} clusters${childSections.length ? ` · ${childSections.length} subsection${childSections.length === 1 ? "" : "s"}` : ""}</span>
           </div>
         </div>
-        <div class="tree-section-body">${clustersHtml || '<p class="muted small">No clusters in this section yet.</p>'}</div>
+        <div class="tree-section-body">
+          ${clustersHtml || (childSections.length ? "" : '<p class="muted small">No clusters in this section yet.</p>')}
+          ${childSectionsHtml}
+        </div>
       </div>`;
-  }).join("");
+  }
+
+  const rootSections = childrenByParent.get("__root__") || [];
+  const sectionsHtml = rootSections.map(renderSectionNode).join("");
 
   panel.innerHTML = `
     ${toolbarHtml}
-    <div class="hierarchy-tree-view"><div class="tree">${sectionsHtml}</div></div>
-    <div class="hierarchy-graph-view hidden"></div>`;
+    <div class="hierarchy-tree-view"><div class="tree">${sectionsHtml}</div></div>`;
 
   // Bind toggles.
   panel.querySelectorAll('[data-toggle="section"]').forEach(el => {
@@ -1593,26 +1619,23 @@ function renderHierarchy(main) {
     });
   }
 
-  // Bind view-switcher buttons.
-  const treeView = panel.querySelector(".hierarchy-tree-view");
-  const graphView = panel.querySelector(".hierarchy-graph-view");
-  panel.querySelectorAll("[data-view]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      panel.querySelectorAll("[data-view]").forEach(b => b.classList.remove("active"));
-      btn.classList.add("active");
-      const target = btn.dataset.view;
-      treeView.classList.toggle("hidden", target !== "tree");
-      graphView.classList.toggle("hidden", target !== "graph");
-      if (target === "graph" && !graphView.dataset.loaded) {
-        graphView.innerHTML = `
-          <iframe class="graph-viz-frame" src="/api/projects/${encodeURIComponent(state.current)}/graph-viz" loading="lazy"></iframe>
-          <p class="muted small" style="text-align: right; margin-top: 6px;">
-            Interactive cytoscape.js layout · drag nodes, scroll to zoom, click for details
-          </p>`;
-        graphView.dataset.loaded = "1";
-      }
-    });
-  });
+}
+
+
+// Standalone interactive-graph view, used by the Sources → Graph
+// sub-tab. The /graph-viz endpoint serves a self-contained
+// cytoscape.js page; we just iframe it.
+function renderHierarchyGraph(main) {
+  const panel = main.querySelector('[data-bind="graph"]');
+  if (!panel) return;
+  const projSlug = encodeURIComponent(state.current);
+  panel.innerHTML = `
+    <div class="graph-frame-wrap">
+      <iframe class="graph-viz-frame" src="/api/projects/${projSlug}/graph-viz" loading="lazy"></iframe>
+      <p class="muted small" style="text-align: right; margin-top: 6px;">
+        Interactive cytoscape.js layout · drag nodes, scroll to zoom, click for details
+      </p>
+    </div>`;
 }
 
 function renderClaimNode(claim) {
@@ -2945,9 +2968,113 @@ async function renderReviewVoiceSubview(body) {
 async function renderReviewGapSubview(body) {
   const proj = encodeURIComponent(state.current);
   let res = await Promise.allSettled([
-    fetchJSON(`/api/projects/${proj}/source-gap`),
+    fetchJSON(`/api/projects/${proj}/lit-gaps`),
   ]);
-  body.innerHTML = renderGapHtml(res[0]);
+  body.innerHTML = renderLitGapsHtml(res[0]);
+}
+
+
+function renderLitGapsHtml(res) {
+  if (res.status !== "fulfilled") {
+    return `
+      <div class="card">
+        <p class="muted small">No lit-gaps report yet. Run <strong>Find gaps</strong> from the Activities tab — it analyses the scaffold per section to surface canonical works, counter-arguments, and recent literature the paper isn't engaging with.</p>
+      </div>`;
+  }
+  const report = res.value;
+  if (!report.sections || !report.sections.length) {
+    return `<div class="card"><p class="muted small">Report has no sections.</p></div>`;
+  }
+  const verifiedRatio = report.total_suggestions
+    ? `${report.verified_count}/${report.total_suggestions}`
+    : "0/0";
+  const generatedTime = report.generated_at
+    ? formatTimestamp(new Date(report.generated_at).getTime() / 1000)
+    : "—";
+
+  const sectionsHtml = report.sections.map(sec => {
+    if (!sec.suggestions.length) {
+      return `
+        <div class="lit-section">
+          <h4 class="lit-section-head">${escapeHtml(sec.section_title)}
+            <span class="muted small">no gaps suggested</span></h4>
+        </div>`;
+    }
+    const byKind = {canonical: [], counter_argument: [], recent: []};
+    sec.suggestions.forEach(s => (byKind[s.kind] || byKind.canonical).push(s));
+    const renderGroup = (label, items) => items.length ? `
+      <div class="lit-group">
+        <h5 class="lit-group-head">${escapeHtml(label)} <span class="muted small">${items.length}</span></h5>
+        ${items.map(renderLitSuggestion).join("")}
+      </div>` : "";
+    return `
+      <div class="lit-section">
+        <h4 class="lit-section-head">
+          ${escapeHtml(sec.section_title)}
+          <span class="muted small">${sec.suggestions.length} suggestion${sec.suggestions.length === 1 ? "" : "s"}</span>
+        </h4>
+        ${renderGroup("Canonical works", byKind.canonical)}
+        ${renderGroup("Counter-arguments", byKind.counter_argument)}
+        ${renderGroup("Recent (last 5y)", byKind.recent)}
+      </div>`;
+  }).join("");
+
+  return `
+    <div class="card">
+      <div class="lit-summary">
+        <h3 class="subhead">Literature gaps · ${report.total_suggestions} suggestion(s)</h3>
+        <div class="lit-summary-meta">
+          <span class="pill ${report.mode === "thorough" ? "ok" : ""}">${escapeHtml(report.mode)} mode</span>
+          <span class="muted small">Verified on OpenAlex: <strong>${verifiedRatio}</strong></span>
+          <span class="muted small">Generated: ${generatedTime}</span>
+        </div>
+      </div>
+      <div class="lit-sections">${sectionsHtml}</div>
+    </div>`;
+}
+
+
+function renderLitSuggestion(s) {
+  const verifiedBadge = s.verified
+    ? `<span class="pill ok">verified</span>`
+    : `<span class="pill" title="Not verified on OpenAlex — could be hallucinated">unverified</span>`;
+  const confBadge = `<span class="pill conf-${escapeAttr(s.confidence)}">${escapeHtml(s.confidence)}</span>`;
+  const claimRefs = (s.claim_ids || []).length
+    ? `<span class="muted small">→ ${s.claim_ids.map(c => `<code>${escapeHtml(c)}</code>`).join(" ")}</span>`
+    : "";
+  const linkBits = [];
+  if (s.doi) {
+    const cleanDoi = String(s.doi).replace(/^https?:\/\/doi\.org\//, "");
+    linkBits.push(
+      `<a href="https://doi.org/${encodeURIComponent(cleanDoi)}" target="_blank" rel="noopener">DOI</a>`
+    );
+  }
+  if (s.openalex_id) {
+    linkBits.push(`<a href="${escapeAttr(s.openalex_id)}" target="_blank" rel="noopener">OpenAlex</a>`);
+  }
+  const citationLine = s.canonical_title
+    ? `<div class="lit-canonical muted small">
+         <strong>${escapeHtml(s.canonical_authors[0] || s.author)}</strong>
+         ${s.publication_year ? ` (${s.publication_year})` : ""}
+         · ${escapeHtml(s.canonical_title)}
+         ${typeof s.cited_by_count === "number" ? ` · cited ${s.cited_by_count.toLocaleString()}×` : ""}
+         ${linkBits.length ? ` · ${linkBits.join(" · ")}` : ""}
+       </div>`
+    : "";
+  return `
+    <div class="lit-suggestion ${s.verified ? "verified" : "unverified"}">
+      <div class="lit-head">
+        <span class="lit-author">${escapeHtml(s.author)}${s.year ? ` (${s.year})` : ""}</span>
+        <span class="lit-title">${escapeHtml(s.work)}</span>
+      </div>
+      <div class="lit-meta">
+        ${verifiedBadge}
+        ${confBadge}
+        ${claimRefs}
+      </div>
+      <p class="lit-why">${escapeHtml(s.why_relevant)}</p>
+      ${citationLine}
+    </div>`;
 }
 
 async function renderReviewChangelogSubview(body) {
@@ -3500,4 +3627,1205 @@ function formatBytes(b) {
   if (b < 1024) return `${b} B`;
   if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
   return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+
+// ════════════════════════════════════════════════════════════
+// Activities tab — verb-oriented action surface (replaces the
+// review-level radio + "Start review" button). Each card opens a
+// focused sheet with only the inputs that activity needs; locked
+// cards show the unlock condition instead of being hidden.
+// ════════════════════════════════════════════════════════════
+
+const ACTIVITY_DEFS = [
+  {
+    verb: "ingest",
+    name: "Re-ingest",
+    icon: "↻",
+    summary: "Re-parse the outline → graph + cluster plan. No LLM, deterministic.",
+    fastHint: "Same as Thorough — ingest never calls Claude.",
+    thoroughHint: "Same as Fast — ingest never calls Claude.",
+  },
+  {
+    verb: "scaffold",
+    name: "Scaffold",
+    icon: "▤",
+    summary: "Outline → graph → cluster plan.",
+    fastHint: "Skip relationship inference and reference extraction.",
+    thoroughHint: "Infer claim relationships and pull references from raw text.",
+  },
+  {
+    verb: "draft",
+    name: "Draft",
+    icon: "✎",
+    summary: "Render prose from the cluster plan.",
+    fastHint: "No autocorrect — render straight from the graph.",
+    thoroughHint: "Run autocorrect=safe to fix mechanical voice nits inline.",
+  },
+  {
+    verb: "find_gaps",
+    name: "Find gaps",
+    icon: "⚠",
+    summary: "Per-section: what canonical literature is the paper missing?",
+    fastHint: "Claude only — fastest, but suggestions aren't verified.",
+    thoroughHint: "Claude + OpenAlex verification of every suggested work.",
+  },
+  {
+    verb: "refine",
+    name: "Refine",
+    icon: "✓",
+    summary: "Audit the draft, then iterate until it converges.",
+    fastHint: "Audit only — produce flags for manual review.",
+    thoroughHint: "Convergence loop (autocorrect=aggressive) + voice review.",
+  },
+  {
+    verb: "restructure",
+    name: "Restructure",
+    icon: "⇅",
+    summary: "Audit the document order against academic-writing rules.",
+    fastHint: "Section-level only — fastest pass.",
+    thoroughHint: "Section + per-section cluster ordering.",
+  },
+  {
+    verb: "review",
+    name: "Review",
+    icon: "§",
+    summary: "Supervisor-style critique with marked track changes.",
+    fastHint: "Per-cluster revisions only.",
+    thoroughHint: "Per-cluster + per-section + overall critique.",
+  },
+];
+
+
+// Shared sub-nav scaffolder. Mounts a tab strip + body inside `panel`
+// and dispatches to one of the supplied subview renderers based on
+// `initialSubTab`. Every primary tab uses this for visual consistency
+// with the Output pattern.
+function buildTabSubnav(panel, tabs, initialSubTab, renderers) {
+  panel.innerHTML = "";
+  const validIds = new Set(tabs.map(t => t.id));
+  const startTab = validIds.has(initialSubTab) ? initialSubTab : tabs[0].id;
+
+  const subnav = document.createElement("nav");
+  subnav.className = "review-subnav";
+  subnav.innerHTML = tabs.map(t =>
+    `<button class="review-tab" data-r-tab="${escapeAttr(t.id)}">${escapeHtml(t.label)}</button>`
+  ).join("");
+  panel.appendChild(subnav);
+
+  const body = document.createElement("div");
+  body.className = "review-body";
+  panel.appendChild(body);
+
+  function showSubview(name) {
+    panel.querySelectorAll(".review-tab").forEach(t =>
+      t.classList.toggle("active", t.dataset.rTab === name));
+    body.innerHTML = `<div class="muted small" style="padding: 12px;">Loading…</div>`;
+    const fn = renderers[name];
+    if (typeof fn === "function") fn(body);
+  }
+  panel.querySelectorAll(".review-tab").forEach(t => {
+    t.addEventListener("click", () => showSubview(t.dataset.rTab));
+  });
+  showSubview(startTab);
+  return {body, showSubview};
+}
+
+
+// ─── Dashboard tab — at-a-glance project status + change log ──
+
+function renderDashboardTab(main, initialSubTab) {
+  const panel = main.querySelector('[data-bind="dashboard-panel"]');
+  buildTabSubnav(panel, [
+    {id: "summary",    label: "Summary"},
+    {id: "changelogs", label: "Change log"},
+  ], initialSubTab, {
+    summary(body) {
+      // Inject the bind target the legacy renderDashboard expects.
+      body.innerHTML = "";
+      const host = document.createElement("div");
+      host.dataset.bind = "dashboard";
+      body.appendChild(host);
+      renderDashboard(main);
+    },
+    changelogs(body) {
+      renderReviewChangelogSubview(body);
+    },
+  });
+}
+
+
+async function renderActivitiesTab(main, initialSubTab) {
+  const panel = main.querySelector('[data-bind="activities-panel"]');
+  buildTabSubnav(panel, [
+    {id: "start",   label: "Start"},
+    {id: "running", label: "Running"},
+    {id: "history", label: "History"},
+  ], initialSubTab, {
+    start(body)  { renderActivitiesStart(body); },
+    running(body) { renderActivitiesRunning(body); },
+    history(body) { renderActivitiesHistory(body); },
+  });
+}
+
+
+async function renderActivitiesStart(body) {
+  body.innerHTML = "";
+  body.appendChild(cloneTemplate("tpl-activity-launcher"));
+
+  const wrapper = body.querySelector(".activities-wrapper");
+  const banner = wrapper.querySelector('[data-bind="state-banner"]');
+  const cardsHost = wrapper.querySelector('[data-bind="cards"]');
+  const historyHost = wrapper.querySelector('[data-bind="history"]');
+  // Hide the inline history block — there's a dedicated History sub-tab now.
+  if (historyHost) historyHost.classList.add("hidden");
+
+  banner.innerHTML = `<div class="muted small">Loading project state…</div>`;
+  let projectStateData;
+  try {
+    projectStateData = await fetchJSON(
+      `/api/projects/${encodeURIComponent(state.current)}/state`
+    );
+  } catch (err) {
+    banner.innerHTML = `<div class="empty-state">Failed to load state: ${escapeHtml(err.message)}</div>`;
+    return;
+  }
+  state.projectState = projectStateData;
+
+  const stateLabel = ({
+    S0: "Empty — add an outline to get started",
+    S1: "Outline added — ready to scaffold",
+    S2: "Scaffolded — ready to draft",
+    S3: "Drafted — ready to refine or find gaps",
+    S4: "Reviewed — flags ready for action",
+  })[projectStateData.state] || projectStateData.state;
+  banner.innerHTML = `
+    <div class="state-pill"><span class="dot"></span><strong>${escapeHtml(projectStateData.state)}</strong> · ${escapeHtml(stateLabel)}</div>
+  `;
+
+  // Activity cards.
+  cardsHost.innerHTML = "";
+  ACTIVITY_DEFS.forEach(def => {
+    const blocker = projectStateData.blockers[def.verb];
+    // The template's root <button> IS the card — cloneTemplate returns
+    // it directly, so we query its descendants for the inner binds.
+    const cardBtn = cloneTemplate("tpl-activity-card");
+    cardBtn.querySelector('[data-bind="icon"]').textContent = def.icon;
+    cardBtn.querySelector('[data-bind="name"]').textContent = def.name;
+    cardBtn.querySelector('[data-bind="summary"]').textContent = def.summary;
+
+    const statePill = cardBtn.querySelector('[data-bind="state-pill"]');
+    const meta = cardBtn.querySelector('[data-bind="meta"]');
+
+    // Compute "last run" for this verb from history.
+    const last = (projectStateData.history || [])
+      .slice().reverse().find(h => h.verb === def.verb);
+    if (blocker) {
+      cardBtn.disabled = true;
+      cardBtn.classList.add("locked");
+      statePill.textContent = "Locked";
+      statePill.className = "activity-state locked";
+      meta.textContent = blocker;
+    } else {
+      statePill.textContent = "Ready";
+      statePill.className = "activity-state ready";
+      meta.textContent = last
+        ? `Last run · ${formatTimestamp(new Date(last.finished_at).getTime() / 1000)} (${last.mode})`
+        : "Never run";
+      cardBtn.addEventListener("click", () => openActivitySheet(def, projectStateData));
+    }
+    cardsHost.appendChild(cardBtn);
+  });
+}
+
+
+// "Running" sub-tab: shows the live progress card if a run is in
+// flight, otherwise an idle prompt. ``state.lastActivityRun`` is set
+// by attachActivityProgress when a new activity starts.
+function renderActivitiesRunning(body) {
+  body.innerHTML = "";
+  const runInfo = state.lastActivityRun;
+  if (!runInfo) {
+    body.innerHTML = `
+      <div class="empty-state">
+        <h3>No active run</h3>
+        <p>Start an activity from the Start tab — its live progress will appear here.</p>
+      </div>`;
+    return;
+  }
+  // Re-attach the progress card. If the run already finished, the
+  // existing summary block stays visible inside the card.
+  const slot = document.createElement("div");
+  slot.dataset.bind = "progress";
+  body.appendChild(slot);
+  slot.appendChild(cloneTemplate("tpl-activity-progress"));
+  slot.querySelector('[data-bind="title"]').textContent =
+    `${runInfo.verbName} (${runInfo.mode}) · live progress`;
+  // If the WebSocket is still open, hand the new container off to it.
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    startTimeline({run_id: runInfo.run_id}, slot);
+    state.activityProgressPanel = slot;
+  } else {
+    // Run already concluded — render a static summary the user can re-read.
+    const status = slot.querySelector('[data-bind="status"]');
+    status.classList.remove("hidden");
+    slot.querySelector('[data-bind="run-id"]').textContent = runInfo.run_id;
+    slot.querySelector('[data-bind="state"]').textContent = "ended";
+    slot.querySelector('[data-bind="state"]').className = "pill";
+  }
+}
+
+
+async function renderActivitiesHistory(body) {
+  body.innerHTML = `<div class="muted small" style="padding: 12px;">Loading history…</div>`;
+  let stateData;
+  try {
+    stateData = await fetchJSON(
+      `/api/projects/${encodeURIComponent(state.current)}/state`
+    );
+  } catch (err) {
+    body.innerHTML = `<div class="empty-state">Failed to load: ${escapeHtml(err.message)}</div>`;
+    return;
+  }
+  const history = (stateData.history || []).slice().reverse();
+  if (!history.length) {
+    body.innerHTML = `
+      <div class="empty-state">
+        <h3>No activities run yet</h3>
+        <p>Start one from the <strong>Start</strong> tab.</p>
+      </div>`;
+    return;
+  }
+  body.innerHTML = `
+    <ul class="history-list">
+      ${history.map(h => `
+        <li>
+          <span class="history-verb">${escapeHtml(h.verb)}</span>
+          <span class="muted small">${escapeHtml(h.mode)}</span>
+          <span class="muted small">${formatTimestamp(new Date(h.finished_at).getTime() / 1000)}</span>
+          <span class="muted small">${formatDuration(h.elapsed_seconds || 0)}</span>
+          <span class="pill ${h.finalise_succeeded ? "ok" : "bad"}">
+            ${h.finalise_succeeded ? "ok" : "blocked"}
+          </span>
+        </li>
+      `).join("")}
+    </ul>`;
+}
+
+
+function openActivitySheet(def, projectStateData) {
+  const sheet = cloneTemplate("tpl-activity-sheet");
+  document.body.appendChild(sheet);
+  sheet.querySelector('[data-bind="title"]').textContent = def.name;
+  sheet.querySelector('[data-bind="lede"]').textContent = def.summary;
+  sheet.querySelector('[data-bind="submit"]').textContent = `Start ${def.name}`;
+
+  // Per-activity fields.
+  const fieldsHost = sheet.querySelector('[data-bind="fields"]');
+  const voices = (state.detail.voices && state.detail.voices.length)
+    ? state.detail.voices : ["academic"];
+  const voiceField = `
+    <label class="field">
+      <span class="field-label">Voice</span>
+      <select name="voice">
+        ${voices.map(v => `<option value="${escapeAttr(v)}">${escapeHtml(v)}</option>`).join("")}
+      </select>
+    </label>`;
+  fieldsHost.insertAdjacentHTML("beforeend", voiceField);
+
+  // find_gaps no longer takes per-run inputs — it reads the scaffold
+  // and (in thorough mode) verifies via OpenAlex. The mode toggle
+  // covers the only meaningful choice.
+  if (def.verb === "draft") {
+    fieldsHost.insertAdjacentHTML("beforeend", `
+      <label class="field-check">
+        <input type="checkbox" name="force" />
+        <span>Force re-render every cluster (ignore cache)</span>
+      </label>`);
+  }
+  if (def.verb === "scaffold") {
+    fieldsHost.insertAdjacentHTML("beforeend", `
+      <label class="field">
+        <span class="field-label">Section depth</span>
+        <select name="nesting_depth">
+          <option value="1">1 — flat (top-level sections only)</option>
+          <option value="2" selected>2 — sections + subsections (## A.1)</option>
+          <option value="3">3 — also sub-subsections (### A.1.1)</option>
+        </select>
+        <span class="muted small">Caps how deep the auto-outliner can nest. Only applied when the outline is raw prose and Claude has to extract structure.</span>
+      </label>`);
+  }
+  if (def.verb === "refine") {
+    fieldsHost.insertAdjacentHTML("beforeend", `
+      <label class="field">
+        <span class="field-label">Max convergence passes</span>
+        <input type="number" name="max_passes" value="3" min="1" max="6" />
+        <span class="muted small">Only used in Thorough mode.</span>
+      </label>`);
+  }
+  // (Both modes are valid for find_gaps: fast = Claude only,
+  // thorough = Claude + OpenAlex verification.)
+
+  // Mode hint: show the right hint as the user toggles.
+  const hintEl = sheet.querySelector('[data-bind="mode-hint"]');
+  function setHint() {
+    const mode = sheet.querySelector('input[name="mode"]:checked').value;
+    hintEl.textContent = mode === "fast" ? def.fastHint : def.thoroughHint;
+  }
+  setHint();
+  sheet.querySelectorAll('input[name="mode"]').forEach(r =>
+    r.addEventListener("change", setHint));
+
+  // Wire close + submit.
+  sheet.querySelectorAll('[data-action="close"]').forEach(btn =>
+    btn.addEventListener("click", () => sheet.remove()));
+
+  const form = sheet.querySelector('[data-bind="form"]');
+  form.addEventListener("submit", async ev => {
+    ev.preventDefault();
+    const fd = new FormData(form);
+    const body = {
+      voice: fd.get("voice") || "academic",
+      mode: fd.get("mode") || "thorough",
+    };
+    if (def.verb === "draft") {
+      body.force = fd.get("force") === "on";
+    }
+    if (def.verb === "refine") {
+      body.max_passes = Number(fd.get("max_passes") || 3);
+    }
+    if (def.verb === "scaffold") {
+      body.nesting_depth = Number(fd.get("nesting_depth") || 2);
+    }
+    const errEl = sheet.querySelector('[data-bind="error"]');
+    errEl.textContent = "";
+    try {
+      const resp = await fetch(
+        `/api/projects/${encodeURIComponent(state.current)}/activities/${def.verb}`,
+        {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(body),
+        }
+      );
+      if (!resp.ok) {
+        errEl.textContent = await resp.text();
+        return;
+      }
+      const data = await resp.json();
+      sheet.remove();
+      attachActivityProgress(def, data);
+    } catch (err) {
+      errEl.textContent = `Network error: ${err.message}`;
+    }
+  });
+}
+
+
+function attachActivityProgress(def, runData) {
+  // Cache the run so the Running sub-tab can reattach if the user
+  // navigates away and back.
+  state.lastActivityRun = {
+    run_id: runData.run_id,
+    verb: def.verb,
+    verbName: def.name,
+    mode: runData.mode,
+  };
+  // Navigate to the Running sub-tab; the renderer there will mount
+  // the progress card and start the timeline + WebSocket.
+  navigate(`/p/${encodeURIComponent(state.current)}/activities/running`);
+  // Wait one tick for the route change to render, then mount.
+  setTimeout(() => {
+    const main = document.getElementById("app");
+    const slot = main.querySelector('.review-body [data-bind="progress"]');
+    if (!slot) return;
+    slot.innerHTML = "";
+    slot.appendChild(cloneTemplate("tpl-activity-progress"));
+    slot.querySelector('[data-bind="title"]').textContent =
+      `${def.name} (${runData.mode}) · live progress`;
+    startTimeline(runData, slot);
+    openWebSocket(state.current, runData.run_id, slot);
+    state.activityProgressPanel = slot;
+  }, 0);
+}
+
+
+// ════════════════════════════════════════════════════════════
+// Sources tab — outline graph + source files + references all
+// stacked as collapsible sections inside one tab. Each section
+// hosts a [data-bind] target so the existing legacy renderers
+// can populate it without rewriting their internals.
+// ════════════════════════════════════════════════════════════
+
+function renderSourcesTab(main, initialSubTab) {
+  const panel = main.querySelector('[data-bind="sources-panel"]');
+  buildTabSubnav(panel, [
+    {id: "outline",    label: "Outline"},
+    {id: "graph",      label: "Graph"},
+    {id: "files",      label: "Source files"},
+    {id: "references", label: "References"},
+  ], initialSubTab, {
+    outline(body) {
+      // Inject a host with the bind target the existing renderer expects.
+      body.innerHTML = "";
+      const host = document.createElement("div");
+      host.dataset.bind = "outline";
+      body.appendChild(host);
+      renderHierarchy(main);
+    },
+    graph(body) {
+      body.innerHTML = "";
+      const host = document.createElement("div");
+      host.dataset.bind = "graph";
+      body.appendChild(host);
+      renderHierarchyGraph(main);
+    },
+    files(body) {
+      body.innerHTML = "";
+      const host = document.createElement("div");
+      host.dataset.bind = "sources";
+      body.appendChild(host);
+      renderSources(main);
+    },
+    references(body) {
+      body.innerHTML = "";
+      const host = document.createElement("div");
+      host.dataset.bind = "references";
+      body.appendChild(host);
+      renderReferences(main);
+    },
+  });
+}
+
+
+// ════════════════════════════════════════════════════════════
+// Output tab — paper, audit flags, voice review, source-gap
+// report, and the change log. All read-only artefacts produced
+// by activities; consolidating them into one tab avoids the
+// previous 5-tab clutter.
+// ════════════════════════════════════════════════════════════
+
+function renderOutputTab(main, initialSubTab) {
+  const panel = main.querySelector('[data-bind="output-panel"]');
+  panel.innerHTML = "";
+
+  const validSubTabs = new Set([
+    "audit", "voice", "gap", "restructure", "review", "changelog",
+  ]);
+  const startTab = validSubTabs.has(initialSubTab) ? initialSubTab : "audit";
+
+  const subnav = document.createElement("nav");
+  subnav.className = "review-subnav";
+  subnav.innerHTML = `
+    <button class="review-tab" data-r-tab="audit">Audit flags</button>
+    <button class="review-tab" data-r-tab="voice">Voice review</button>
+    <button class="review-tab" data-r-tab="gap">Lit gaps</button>
+    <button class="review-tab" data-r-tab="restructure">Restructure</button>
+    <button class="review-tab" data-r-tab="review">Review</button>
+    <button class="review-tab" data-r-tab="changelog">Change log</button>
+  `;
+  panel.appendChild(subnav);
+
+  const body = document.createElement("div");
+  body.className = "review-body";
+  panel.appendChild(body);
+
+  function showSubview(name) {
+    panel.querySelectorAll(".review-tab").forEach(t =>
+      t.classList.toggle("active", t.dataset.rTab === name));
+    body.innerHTML = `<div class="muted small" style="padding: 12px;">Loading…</div>`;
+    if (name === "audit")          renderReviewAuditSubview(body);
+    else if (name === "voice")     renderReviewVoiceSubview(body);
+    else if (name === "gap")       renderReviewGapSubview(body);
+    else if (name === "restructure") renderRestructureSubview(body);
+    else if (name === "review")    renderSupervisorReviewSubview(body);
+    else if (name === "changelog") renderReviewChangelogSubview(body);
+  }
+  panel.querySelectorAll(".review-tab").forEach(t => {
+    t.addEventListener("click", () => showSubview(t.dataset.rTab));
+  });
+  showSubview(startTab);
+}
+
+
+// ════════════════════════════════════════════════════════════
+// Compare — cross-project scaffold comparison. Lives on the
+// projects list page; opens a modal to pick two projects, runs
+// /api/compare synchronously, then renders a results page in
+// place of the projects grid.
+// ════════════════════════════════════════════════════════════
+
+function openCompareModal(projects) {
+  if (projects.length < 2) {
+    alert("Need at least two projects to compare. Create or scaffold another project first.");
+    return;
+  }
+  const modal = cloneTemplate("tpl-compare-modal");
+  document.body.appendChild(modal);
+
+  const optsHtml = projects.map(p =>
+    `<option value="${escapeAttr(p.name)}">${escapeHtml(p.display_name || p.name)}</option>`
+  ).join("");
+  const selectA = modal.querySelector('[data-bind="select-a"]');
+  const selectB = modal.querySelector('[data-bind="select-b"]');
+  selectA.innerHTML = optsHtml;
+  selectB.innerHTML = optsHtml;
+  if (projects.length >= 2) {
+    selectA.value = projects[0].name;
+    selectB.value = projects[1].name;
+  }
+
+  modal.querySelectorAll('[data-action="close"]').forEach(btn =>
+    btn.addEventListener("click", () => modal.remove()));
+
+  const form = modal.querySelector('[data-bind="form"]');
+  const errEl = modal.querySelector('[data-bind="error"]');
+  form.addEventListener("submit", async ev => {
+    ev.preventDefault();
+    const fd = new FormData(form);
+    const body = {
+      project_a: fd.get("project_a"),
+      project_b: fd.get("project_b"),
+      mode: fd.get("mode") || "thorough",
+    };
+    if (body.project_a === body.project_b) {
+      errEl.textContent = "Pick two different projects.";
+      return;
+    }
+    errEl.textContent = "";
+    const submitBtn = form.querySelector('button[type="submit"]');
+    submitBtn.disabled = true;
+    submitBtn.textContent = body.mode === "thorough"
+      ? "Comparing… (~30s)"
+      : "Comparing…";
+    try {
+      const resp = await fetch("/api/compare", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) {
+        errEl.textContent = await resp.text();
+        submitBtn.disabled = false;
+        submitBtn.textContent = "Compare →";
+        return;
+      }
+      const report = await resp.json();
+      modal.remove();
+      renderCompareResults(report);
+    } catch (err) {
+      errEl.textContent = `Network error: ${err.message}`;
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Compare →";
+    }
+  });
+}
+
+
+function renderCompareResults(report) {
+  const main = document.getElementById("app");
+  main.innerHTML = "";
+  main.appendChild(cloneTemplate("tpl-compare-results"));
+  setBreadcrumb([{label: "Projects", href: "/"}, {label: "Compare"}]);
+
+  const a = report.project_a;
+  const b = report.project_b;
+  main.querySelector('[data-bind="title"]').textContent =
+    `${a.project_name} ⇄ ${b.project_name}`;
+  main.querySelector('[data-bind="subtitle"]').textContent =
+    `${report.mode === "thorough" ? "LLM semantic comparison" : "Structural comparison"} · ` +
+    `${report.pairs.length} paired claim(s)`;
+
+  main.querySelector('[data-action="back"]')
+    .addEventListener("click", () => navigate("/"));
+
+  // Structural summary table.
+  const sumEl = main.querySelector('[data-bind="summary"]');
+  sumEl.innerHTML = `
+    <h3 class="subhead">Structural summary</h3>
+    <table class="compare-table">
+      <thead>
+        <tr><th></th><th>${escapeHtml(a.project_name)}</th><th>${escapeHtml(b.project_name)}</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="muted">Sections</td><td>${a.section_count}</td><td>${b.section_count}</td></tr>
+        <tr><td class="muted">Claims</td><td>${a.claim_count}</td><td>${b.claim_count}</td></tr>
+        <tr><td class="muted">Relationships</td><td>${a.relationship_count}</td><td>${b.relationship_count}</td></tr>
+        <tr><td class="muted">Thesis</td>
+          <td class="compare-thesis-cell">${escapeHtml(a.thesis_statement || "—")}</td>
+          <td class="compare-thesis-cell">${escapeHtml(b.thesis_statement || "—")}</td>
+        </tr>
+      </tbody>
+    </table>`;
+
+  // Thesis comparison.
+  const thesisEl = main.querySelector('[data-bind="thesis"]');
+  if (report.thesis_comparison) {
+    const t = report.thesis_comparison;
+    thesisEl.innerHTML = `
+      <h3 class="subhead">Thesis comparison</h3>
+      <span class="pill ${t.agreement === "opposing" ? "bad" : t.agreement === "same" ? "ok" : ""}">${escapeHtml(t.agreement)}</span>
+      <p>${escapeHtml(t.summary)}</p>`;
+  } else {
+    thesisEl.innerHTML = `
+      <h3 class="subhead">Thesis comparison</h3>
+      <p class="muted small">Not computed (fast mode or one thesis missing).</p>`;
+  }
+
+  // Pairs.
+  const pairsEl = main.querySelector('[data-bind="pairs"]');
+  if (!report.pairs.length) {
+    pairsEl.innerHTML = `
+      <h3 class="subhead">Paired claims</h3>
+      <p class="muted small">No paired claims found. Either the papers cover unrelated material, or fast mode skipped the LLM pairing.</p>`;
+  } else {
+    pairsEl.innerHTML = `
+      <h3 class="subhead">Paired claims (${report.pairs.length})</h3>
+      <div class="pair-list">
+        ${report.pairs.map(p => `
+          <div class="pair">
+            <div class="pair-head">
+              <span class="pill rel-${escapeAttr(p.relationship)}">${escapeHtml(p.relationship)}</span>
+              <span class="muted small">${escapeHtml(p.confidence)} confidence</span>
+            </div>
+            <div class="pair-body">
+              <div class="pair-side"><span class="muted small">${escapeHtml(a.project_name)}</span><p>${escapeHtml(p.claim_a_text)}</p></div>
+              <div class="pair-arrow">⇄</div>
+              <div class="pair-side"><span class="muted small">${escapeHtml(b.project_name)}</span><p>${escapeHtml(p.claim_b_text)}</p></div>
+            </div>
+            ${p.rationale ? `<p class="pair-rationale muted small">${escapeHtml(p.rationale)}</p>` : ""}
+          </div>
+        `).join("")}
+      </div>`;
+  }
+
+  // Unique-to-each lists.
+  const uaEl = main.querySelector('[data-bind="unique-a"]');
+  const ubEl = main.querySelector('[data-bind="unique-b"]');
+  uaEl.innerHTML = `
+    <h3 class="subhead">Only in ${escapeHtml(a.project_name)} (${report.unique_a.length})</h3>
+    ${report.unique_a.length ? `<ul class="unique-list">${
+      report.unique_a.slice(0, 30).map(c =>
+        `<li>${escapeHtml(c.text)}</li>`
+      ).join("")
+    }</ul>${report.unique_a.length > 30 ? `<p class="muted small">+${report.unique_a.length - 30} more.</p>` : ""}` :
+      `<p class="muted small">All claims paired.</p>`}`;
+  ubEl.innerHTML = `
+    <h3 class="subhead">Only in ${escapeHtml(b.project_name)} (${report.unique_b.length})</h3>
+    ${report.unique_b.length ? `<ul class="unique-list">${
+      report.unique_b.slice(0, 30).map(c =>
+        `<li>${escapeHtml(c.text)}</li>`
+      ).join("")
+    }</ul>${report.unique_b.length > 30 ? `<p class="muted small">+${report.unique_b.length - 30} more.</p>` : ""}` :
+      `<p class="muted small">All claims paired.</p>`}`;
+}
+
+
+// ════════════════════════════════════════════════════════════
+// Full Review — split button in the project header that runs
+// every selected activity in sequence (scaffold → draft →
+// find_gaps → refine, only the ticked ones). The caret popover
+// lets the user pick which activities and which mode; the
+// selection persists in localStorage so the next project loads
+// with the same defaults.
+// ════════════════════════════════════════════════════════════
+
+const FULL_REVIEW_ORDER = [
+  "scaffold", "restructure", "draft", "find_gaps", "refine", "review",
+];
+
+const FULL_REVIEW_LABELS = {
+  scaffold:    "Scaffold",
+  restructure: "Restructure",
+  draft:       "Draft",
+  find_gaps:   "Find gaps",
+  refine:      "Refine",
+  review:      "Review",
+};
+
+function getFullReviewConfig() {
+  try {
+    const raw = JSON.parse(localStorage.getItem("lattice.fullReview") || "null");
+    if (raw && typeof raw === "object") {
+      return {
+        verbs: {
+          scaffold:    raw.verbs?.scaffold    ?? true,
+          restructure: raw.verbs?.restructure ?? false,
+          draft:       raw.verbs?.draft       ?? true,
+          find_gaps:   raw.verbs?.find_gaps   ?? true,
+          refine:      raw.verbs?.refine      ?? true,
+          review:      raw.verbs?.review      ?? false,
+        },
+        mode: raw.mode === "fast" ? "fast" : "thorough",
+      };
+    }
+  } catch (e) { /* fall through */ }
+  return {
+    verbs: {
+      scaffold: true, restructure: false, draft: true,
+      find_gaps: true, refine: true, review: false,
+    },
+    mode: "thorough",
+  };
+}
+
+function saveFullReviewConfig(cfg) {
+  localStorage.setItem("lattice.fullReview", JSON.stringify(cfg));
+}
+
+function buildFullReviewControlsHtml() {
+  const cfg = getFullReviewConfig();
+  const verbRows = FULL_REVIEW_ORDER.map(v => `
+    <label class="popover-check">
+      <input type="checkbox" name="verb" value="${v}" ${cfg.verbs[v] ? "checked" : ""}/>
+      <span>${escapeHtml(FULL_REVIEW_LABELS[v])}</span>
+    </label>
+  `).join("");
+  return `
+    <div class="full-review-group" data-bind="full-review-group">
+      <button class="btn primary" data-action="run-full-review">Full Review →</button>
+      <button class="btn full-review-caret" data-action="toggle-full-review-popover" aria-label="Pick activities">▾</button>
+      <div class="full-review-popover hidden" data-bind="full-review-popover">
+        <button type="button" class="popover-quick" data-action="quick-reingest"
+          title="Re-parse the outline (deterministic, no LLM)">
+          ↻&nbsp;&nbsp;Re-ingest now
+          <span class="muted small">no LLM, ~1s</span>
+        </button>
+        <p class="popover-head">Activities to run</p>
+        <div class="popover-checks">${verbRows}</div>
+        <div class="popover-modes">
+          <span class="muted small">Mode</span>
+          <label class="popover-mode">
+            <input type="radio" name="mode" value="fast" ${cfg.mode === "fast" ? "checked" : ""}/>
+            <span>Fast</span>
+          </label>
+          <label class="popover-mode">
+            <input type="radio" name="mode" value="thorough" ${cfg.mode === "thorough" ? "checked" : ""}/>
+            <span>Thorough</span>
+          </label>
+        </div>
+        <p class="muted small popover-foot">Saved automatically. Closes on outside click.</p>
+      </div>
+    </div>
+  `;
+}
+
+function wireFullReviewControls(scope, projectName) {
+  const group = scope.querySelector('[data-bind="full-review-group"]');
+  if (!group) return;
+  const popover = group.querySelector('[data-bind="full-review-popover"]');
+
+  group.querySelector('[data-action="toggle-full-review-popover"]')
+    .addEventListener("click", ev => {
+      ev.stopPropagation();
+      popover.classList.toggle("hidden");
+    });
+
+  // Outside-click closes the popover.
+  document.addEventListener("click", ev => {
+    if (!group.contains(ev.target)) popover.classList.add("hidden");
+  });
+
+  // Persist on every change.
+  popover.addEventListener("change", () => {
+    const verbs = {};
+    popover.querySelectorAll('input[name="verb"]').forEach(c =>
+      verbs[c.value] = c.checked);
+    const mode = popover.querySelector('input[name="mode"]:checked')?.value || "thorough";
+    saveFullReviewConfig({verbs, mode});
+  });
+
+  group.querySelector('[data-action="run-full-review"]')
+    .addEventListener("click", () => {
+      popover.classList.add("hidden");
+      runFullReview(projectName);
+    });
+
+  // Quick action: fire a one-off ingest. Doesn't go through the Full
+  // Review sequence — ingest is its own thing, fast and deterministic.
+  group.querySelector('[data-action="quick-reingest"]')
+    .addEventListener("click", () => {
+      popover.classList.add("hidden");
+      runQuickIngest(projectName);
+    });
+}
+
+async function runQuickIngest(projectName) {
+  const def = ACTIVITY_DEFS.find(d => d.verb === "ingest");
+  try {
+    const resp = await fetch(
+      `/api/projects/${encodeURIComponent(projectName)}/activities/ingest`,
+      {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({voice: state.detail?.voices?.[0] || "academic", mode: "fast"}),
+      }
+    );
+    if (!resp.ok) {
+      alert(`Ingest failed: ${await resp.text()}`);
+      return;
+    }
+    const data = await resp.json();
+    attachActivityProgress(def, data);
+  } catch (err) {
+    alert(`Network error: ${err.message}`);
+  }
+}
+
+async function runFullReview(projectName) {
+  const cfg = getFullReviewConfig();
+  const selected = FULL_REVIEW_ORDER.filter(v => cfg.verbs[v]);
+  if (!selected.length) {
+    alert("Pick at least one activity in the dropdown.");
+    return;
+  }
+  // Make sure the user sees progress: navigate to Activities → Running.
+  if (!location.hash.startsWith(`#/p/${encodeURIComponent(projectName)}/activities`)) {
+    navigate(`/p/${encodeURIComponent(projectName)}/activities/running`);
+    await new Promise(r => setTimeout(r, 30));
+  } else {
+    navigate(`/p/${encodeURIComponent(projectName)}/activities/running`);
+    await new Promise(r => setTimeout(r, 30));
+  }
+
+  const main = document.getElementById("app");
+  const body = main.querySelector(".review-body");
+  if (!body) return;
+
+  // Banner showing current step within the sequence.
+  const stepLabels = selected.map(v => FULL_REVIEW_LABELS[v]).join(" → ");
+  body.innerHTML = `
+    <div class="full-review-banner card">
+      <h3 class="subhead">Full Review running</h3>
+      <p class="muted small" data-bind="step">Step 0 of ${selected.length}</p>
+      <p class="muted small">Plan: <strong>${escapeHtml(stepLabels)}</strong> (${escapeHtml(cfg.mode)})</p>
+    </div>
+    <div data-bind="progress-host"></div>
+  `;
+  const stepEl = body.querySelector('[data-bind="step"]');
+  const progressHost = body.querySelector('[data-bind="progress-host"]');
+
+  for (let i = 0; i < selected.length; i++) {
+    const verb = selected[i];
+    stepEl.textContent = `Step ${i + 1} of ${selected.length}: ${FULL_REVIEW_LABELS[verb]}`;
+
+    // Re-fetch state to confirm preconditions still hold (the previous
+    // activity may have produced the artefact this one needs).
+    let projState;
+    try {
+      projState = await fetchJSON(
+        `/api/projects/${encodeURIComponent(projectName)}/state`
+      );
+    } catch (err) {
+      progressHost.insertAdjacentHTML("beforeend",
+        `<div class="empty-state">State refresh failed: ${escapeHtml(err.message)}. Stopping.</div>`);
+      return;
+    }
+    const blocker = projState.blockers[verb];
+    if (blocker) {
+      progressHost.insertAdjacentHTML("beforeend",
+        `<div class="muted small" style="padding: 12px;">Skipped ${escapeHtml(verb)}: ${escapeHtml(blocker)}</div>`);
+      continue;
+    }
+
+    // Mount a fresh progress card for this activity.
+    const slot = document.createElement("div");
+    slot.dataset.fullReviewStep = String(i);
+    progressHost.appendChild(slot);
+    slot.appendChild(cloneTemplate("tpl-activity-progress"));
+    slot.querySelector('[data-bind="title"]').textContent =
+      `${FULL_REVIEW_LABELS[verb]} (${cfg.mode}) · live progress`;
+
+    // Build the request body.
+    const body_ = {voice: state.detail?.voices?.[0] || "academic", mode: cfg.mode};
+    if (verb === "draft")     body_.force = false;
+    if (verb === "refine")    body_.max_passes = 3;
+
+    let runData;
+    try {
+      const resp = await fetch(
+        `/api/projects/${encodeURIComponent(projectName)}/activities/${verb}`,
+        {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(body_),
+        }
+      );
+      if (!resp.ok) {
+        const txt = await resp.text();
+        slot.querySelector('[data-bind="status"]').classList.remove("hidden");
+        slot.querySelector('[data-bind="state"]').textContent = "failed";
+        slot.querySelector('[data-bind="state"]').className = "pill bad";
+        progressHost.insertAdjacentHTML("beforeend",
+          `<div class="muted small" style="padding: 8px;">Failed to start ${escapeHtml(verb)}: ${escapeHtml(txt)}. Stopping.</div>`);
+        return;
+      }
+      runData = await resp.json();
+    } catch (err) {
+      progressHost.insertAdjacentHTML("beforeend",
+        `<div class="empty-state">Network error starting ${escapeHtml(verb)}: ${escapeHtml(err.message)}. Stopping.</div>`);
+      return;
+    }
+
+    // Cache the run so the Running sub-tab knows what's in flight.
+    state.lastActivityRun = {
+      run_id: runData.run_id,
+      verb,
+      verbName: FULL_REVIEW_LABELS[verb],
+      mode: runData.mode,
+    };
+    startTimeline(runData, slot);
+    const ok = await openWebSocketAndWait(projectName, runData.run_id, slot);
+    if (!ok) {
+      progressHost.insertAdjacentHTML("beforeend",
+        `<div class="muted small" style="padding: 8px;">${escapeHtml(verb)} did not finalise. Stopping the sequence.</div>`);
+      return;
+    }
+  }
+
+  stepEl.textContent = `Done · ${selected.length} activit${selected.length === 1 ? "y" : "ies"} ran`;
+  progressHost.insertAdjacentHTML("beforeend",
+    `<div class="card" style="padding: 16px;">
+       <h3 class="subhead">Full Review complete</h3>
+       <p class="muted small">All selected activities finished. Switch to the History sub-tab for the run record, or to Output for the artefacts.</p>
+     </div>`);
+}
+
+// Promise-wrapper around openWebSocket: resolves true on
+// run_finished, false on run_failed or socket close without a
+// terminal event. Used by Full Review to await each activity.
+function openWebSocketAndWait(projectName, runId, panel) {
+  return new Promise(resolve => {
+    if (state.ws) try { state.ws.close(); } catch (e) {}
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${proto}//${location.host}/api/projects/${encodeURIComponent(projectName)}/runs/${runId}`;
+    const ws = new WebSocket(url);
+    state.ws = ws;
+    let settled = false;
+    ws.addEventListener("message", e => {
+      const event = JSON.parse(e.data);
+      handleEvent(event, panel);
+      if (event.type === "run_finished" && !settled) {
+        settled = true;
+        resolve(true);
+      }
+      if (event.type === "run_failed" && !settled) {
+        settled = true;
+        resolve(false);
+      }
+    });
+    ws.addEventListener("close", () => {
+      if (state.elapsedTimer) {
+        clearInterval(state.elapsedTimer);
+        state.elapsedTimer = null;
+      }
+      if (!settled) { settled = true; resolve(false); }
+    });
+    ws.addEventListener("error", () => {
+      if (!settled) { settled = true; resolve(false); }
+    });
+  });
+}
+
+
+// ════════════════════════════════════════════════════════════
+// Output → Restructure sub-tab
+// ════════════════════════════════════════════════════════════
+
+async function renderRestructureSubview(body) {
+  const proj = encodeURIComponent(state.current);
+  let res;
+  try {
+    res = await fetchJSON(`/api/projects/${proj}/restructure`);
+  } catch (err) {
+    body.innerHTML = `
+      <div class="card">
+        <p class="muted small">No restructure report yet. Run <strong>Restructure</strong> from the Activities tab — it audits the document order against academic-writing rules and surfaces dependency violations.</p>
+      </div>`;
+    return;
+  }
+  const generated = res.generated_at
+    ? formatTimestamp(new Date(res.generated_at).getTime() / 1000)
+    : "—";
+
+  const sectionDiff = res.section_reorder ? renderRestructureOrderDiff(
+    "Section order",
+    res.section_reorder.current_order,
+    res.section_reorder.proposed_order,
+    res.section_reorder.commentary,
+  ) : "";
+
+  const clusterDiffs = (res.cluster_reorders || [])
+    .filter(cr => _orderChanged(cr.current_order, cr.proposed_order))
+    .map(cr => renderRestructureOrderDiff(
+      `Clusters in “${cr.section_title}”`,
+      cr.current_order,
+      cr.proposed_order,
+      cr.commentary,
+    )).join("");
+
+  const noChangeNote = !sectionDiff && !clusterDiffs
+    ? `<p class="muted small">No reordering recommended at any level.</p>`
+    : "";
+
+  const suggestionsList = (res.suggestions || []).length
+    ? `
+      <h3 class="subhead" style="margin-top: 18px;">Specific operations (${res.suggestions.length})</h3>
+      <div class="restructure-suggestions">
+        ${res.suggestions.map(renderRestructureSuggestion).join("")}
+      </div>`
+    : "";
+
+  body.innerHTML = `
+    <div class="card">
+      <div class="lit-summary">
+        <h3 class="subhead">Restructure · ${res.suggestions.length} suggestion(s)</h3>
+        <div class="lit-summary-meta">
+          <span class="pill ${res.mode === "thorough" ? "ok" : ""}">${escapeHtml(res.mode)} mode</span>
+          <span class="muted small">Generated: ${generated}</span>
+        </div>
+      </div>
+      ${noChangeNote}
+      ${sectionDiff}
+      ${clusterDiffs}
+      ${suggestionsList}
+    </div>`;
+}
+
+
+function renderRestructureOrderDiff(title, current, proposed, commentary) {
+  const changed = _orderChanged(current, proposed);
+  const renderList = (ids, highlightAt) => `
+    <ol class="order-list">
+      ${ids.map((id, i) => {
+        const moved = highlightAt && current.indexOf(id) !== i;
+        return `<li class="${moved ? "moved" : ""}"><code>${escapeHtml(id)}</code></li>`;
+      }).join("")}
+    </ol>`;
+  return `
+    <div class="restructure-block">
+      <h4 class="restructure-block-head">
+        ${escapeHtml(title)}
+        ${changed ? `<span class="pill">change suggested</span>` : `<span class="pill ok">order looks fine</span>`}
+      </h4>
+      <div class="restructure-diff">
+        <div>
+          <span class="muted small">Current</span>
+          ${renderList(current, false)}
+        </div>
+        <div>
+          <span class="muted small">Proposed</span>
+          ${renderList(proposed, changed)}
+        </div>
+      </div>
+      ${commentary ? `<p class="muted small restructure-commentary">${escapeHtml(commentary)}</p>` : ""}
+    </div>`;
+}
+
+
+function renderRestructureSuggestion(s) {
+  const movePart = s.before_id
+    ? `before <code>${escapeHtml(s.before_id)}</code>`
+    : s.after_id
+      ? `after <code>${escapeHtml(s.after_id)}</code>`
+      : s.paired_id
+        ? `with <code>${escapeHtml(s.paired_id)}</code>`
+        : "";
+  return `
+    <div class="restructure-suggestion">
+      <div class="restructure-suggestion-head">
+        <span class="pill kind-${escapeAttr(s.kind)}">${escapeHtml(s.kind.replace("_", " "))}</span>
+        <span class="pill conf-${escapeAttr(s.confidence)}">${escapeHtml(s.confidence)}</span>
+        <code>${escapeHtml(s.target_id)}</code>
+        ${movePart ? `<span class="muted small">→ ${movePart}</span>` : ""}
+      </div>
+      <p class="restructure-rationale">${escapeHtml(s.rationale)}</p>
+      ${s.rule ? `<p class="muted small restructure-rule">Rule: ${escapeHtml(s.rule)}</p>` : ""}
+    </div>`;
+}
+
+
+function _orderChanged(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b)) return false;
+  if (a.length !== b.length) return true;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return true;
+  }
+  return false;
+}
+
+
+// ════════════════════════════════════════════════════════════
+// Output → Review sub-tab — supervisor critique + track changes
+// ════════════════════════════════════════════════════════════
+
+async function renderSupervisorReviewSubview(body) {
+  const proj = encodeURIComponent(state.current);
+  body.innerHTML = `<div class="muted small" style="padding: 12px;">Loading review…</div>`;
+
+  let report;
+  let trackChanges = "";
+  try {
+    [report, trackChanges] = await Promise.all([
+      fetchJSON(`/api/projects/${proj}/review`),
+      fetchText(`/api/projects/${proj}/review-track-changes`).catch(() => ""),
+    ]);
+  } catch (err) {
+    body.innerHTML = `
+      <div class="card">
+        <p class="muted small">No supervisor review yet. Run <strong>Review</strong> from the Activities tab — it produces a supervisor-style critique of the rendered paper plus a marked track-changes version.</p>
+      </div>`;
+    return;
+  }
+
+  const generated = report.generated_at
+    ? formatTimestamp(new Date(report.generated_at).getTime() / 1000)
+    : "—";
+  const sectionsHtml = (report.section_critiques || []).map(sc => `
+    <details class="review-section">
+      <summary><strong>${escapeHtml(sc.section_title)}</strong></summary>
+      <p>${escapeHtml(sc.critique)}</p>
+    </details>`).join("");
+
+  body.innerHTML = `
+    <div class="card">
+      <div class="lit-summary">
+        <h3 class="subhead">Supervisor review</h3>
+        <div class="lit-summary-meta">
+          <span class="pill ${report.mode === "thorough" ? "ok" : ""}">${escapeHtml(report.mode)} mode</span>
+          <span class="muted small">${(report.cluster_revisions || []).length} cluster(s) reviewed</span>
+          <span class="muted small">Generated: ${generated}</span>
+        </div>
+      </div>
+      <div class="review-toggle">
+        <button class="btn sm active" data-r-mode="critique">Critique</button>
+        <button class="btn sm" data-r-mode="track-changes">Track changes</button>
+      </div>
+      <div class="review-pane review-pane-critique">
+        <h3 class="subhead">Overall</h3>
+        <p>${escapeHtml(report.overall_critique || "(not generated — fast mode)")}</p>
+        <h3 class="subhead">By section</h3>
+        ${sectionsHtml || `<p class="muted small">No section critiques.</p>`}
+      </div>
+      <div class="review-pane review-pane-track-changes hidden">
+        <article class="prose track-changes-prose">${
+          trackChanges
+            ? renderMarkdown(trackChanges)
+            : `<p class="muted small">Track-changes paper not available.</p>`
+        }</article>
+      </div>
+    </div>`;
+
+  // Toggle between critique view and track-changes view.
+  const critiquePane = body.querySelector(".review-pane-critique");
+  const trackPane = body.querySelector(".review-pane-track-changes");
+  body.querySelectorAll("[data-r-mode]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      body.querySelectorAll("[data-r-mode]").forEach(b =>
+        b.classList.toggle("active", b === btn));
+      const mode = btn.dataset.rMode;
+      critiquePane.classList.toggle("hidden", mode !== "critique");
+      trackPane.classList.toggle("hidden", mode !== "track-changes");
+    });
+  });
 }

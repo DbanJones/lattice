@@ -34,7 +34,19 @@ from ..graph.models import (
 from ..utils.config import Config
 
 
-_SECTION_RE = re.compile(r"^#\s*([A-Z])\.\s*(.+?)\s*$")
+# Section heading: ``# A.``, ``## A.1``, ``### A.1.2`` etc. Up to three
+# levels of nesting. The hash count must match the number of components
+# in the path (``A`` = 1, ``A.1`` = 2, ``A.1.2`` = 3) — mismatches are
+# rejected so the author gets a parse error instead of silently mis-nested
+# sections.
+# Path component after the hashes can be ``A``, ``A.1``, ``A.1.2``.
+# The path is optionally followed by a trailing dot (``# A. Title``,
+# legacy single-letter form) but subsection paths typically don't use
+# one (``## A.1 Title``). Either way, whitespace separates the path
+# from the title.
+_SECTION_RE = re.compile(
+    r"^(#+)\s+([A-Z](?:\.\d+)*)(?:\.\s+|\s+)(.+?)\s*$"
+)
 _THESIS_RE = re.compile(r"^#\s*THESIS\s*$", re.IGNORECASE)
 _BULLET_RE = re.compile(r"^(\s*)-\s+(.*)$")
 _TAG_RE = re.compile(r"\[([^\]]+)\]")
@@ -92,12 +104,13 @@ class MarkdownOutlineIngester:
 
         state: dict[str, object] = {
             "mode": None,                # "thesis" | "section" | None
-            "section": None,             # current Section
-            "section_letter": None,      # current letter ("A", "B", ...)
+            "section": None,             # current (innermost) Section
+            "section_letter": None,      # legacy: top-level letter for claim-id derivation
+            "open_sections": [],         # stack of Sections, deepest last; used to set parent
             "thesis_buffer": [],         # collected thesis paragraphs
             "thesis_claim_id": None,     # set once thesis is committed
             "pending_claim": None,       # dict being built
-            "claim_seq_per_section": {}, # letter -> int
+            "claim_seq_per_section": {}, # section_id -> int (was: letter -> int)
             "rel_seq": 0,
             "deferred_rels": [],         # (from_id, target, type) to resolve after pass
             "source_order_seq": 0,       # monotonic claim counter across the whole document
@@ -174,30 +187,87 @@ class MarkdownOutlineIngester:
                 _commit_pending_claim()
                 if state["mode"] == "thesis":
                     _commit_thesis()
-                letter = section_match.group(1)
-                raw_title = section_match.group(2)
+                hashes = section_match.group(1)
+                path = section_match.group(2)            # e.g. "A", "A.1", "A.1.2"
+                raw_title = section_match.group(3)
+                section_depth = len(hashes)              # 1 = top, 2 = sub, 3 = sub-sub
+                path_components = path.split(".")        # ["A"], ["A", "1"], ["A", "1", "2"]
+                # Skip mismatched: e.g. "## A." (depth 2, one path component) is treated
+                # as a nesting bug; fall through to the legacy single-letter path so the
+                # ingest doesn't crash. Older outlines using "# A." are unaffected.
+                if section_depth != len(path_components):
+                    # Best-effort: fall back to top-level interpretation if the path
+                    # is just a single letter and the heading was deeper than expected.
+                    if len(path_components) == 1 and section_depth >= 1:
+                        section_depth = 1
+                    else:
+                        # Genuinely malformed — skip the line so we don't
+                        # poison downstream sections with a phantom one.
+                        continue
+
                 title, tags = _parse_tags(raw_title)
                 role = _SECTION_ROLE_MAP.get(
                     (tags.get("role") or [""])[0], SectionRole.argumentative
                 )
-                depth = _DEPTH_MAP.get((tags.get("depth") or [""])[0], Depth.standard)
+                depth_tag = _DEPTH_MAP.get((tags.get("depth") or [""])[0], Depth.standard)
                 target_length = int((tags.get("words") or ["800"])[0])
+
+                # Derive section_id and parent. Top-level keeps the legacy
+                # "s.<letter>" shape so existing projects don't change ids.
+                top_letter = path_components[0]
+                if section_depth == 1:
+                    section_id = f"s.{top_letter.lower()}"
+                    parent_id = None
+                else:
+                    section_id = (
+                        f"s.{top_letter.lower()}." + ".".join(path_components[1:])
+                    )
+                    # Parent is the path with one fewer component.
+                    if section_depth == 2:
+                        parent_id = f"s.{top_letter.lower()}"
+                    else:
+                        parent_id = (
+                            f"s.{top_letter.lower()}." +
+                            ".".join(path_components[1:-1])
+                        )
+
+                # Pop any deeper sections off the open stack — a new
+                # heading at this depth ends them.
+                stack: list[Section] = state["open_sections"]  # type: ignore[assignment]
+                while stack and (stack[-1].section_id.count(".") >= section_id.count(".")):
+                    stack.pop()
+                # If parent_id is set, the parent must be on the stack (at the
+                # right depth). If it isn't, we have an out-of-order heading
+                # (e.g. ``## A.1`` with no preceding ``# A.``); pretend it's
+                # top-level instead.
+                if parent_id is not None and (
+                    not stack or stack[-1].section_id != parent_id
+                ):
+                    # Promote to top-level rather than dropping the section.
+                    section_id = f"s.{top_letter.lower()}"
+                    parent_id = None
+                    section_depth = 1
+
                 section = Section(
-                    section_id=f"s.{letter.lower()}",
+                    section_id=section_id,
                     title=title.strip(),
-                    parent=None,
+                    parent=parent_id,
                     position=len(graph.sections),
                     role=role,
                     thesis_claim=state["thesis_claim_id"],
                     claim_ids=[],
                     target_length=target_length,
-                    depth=depth,
+                    depth=depth_tag,
                 )
                 graph.sections.append(section)
+                stack.append(section)
                 state["mode"] = "section"
                 state["section"] = section
-                state["section_letter"] = letter
-                state["claim_seq_per_section"][letter] = 0
+                # ``section_letter`` is kept for legacy claim-id derivation —
+                # claims are always tagged with their innermost section's path,
+                # but the readable letter prefix stays the top-level one.
+                state["section_letter"] = top_letter
+                state["claim_seq_per_section"][section_id] = 0
                 continue
 
             bullet_match = _BULLET_RE.match(line)
@@ -256,10 +326,17 @@ class MarkdownOutlineIngester:
             section.figure_ids.append(f"fig.{fig_slug}")
             return None, []
 
-        letter = state["section_letter"]
-        state["claim_seq_per_section"][letter] += 1
-        seq = state["claim_seq_per_section"][letter]
-        claim_id = f"cl.{letter.lower()}.{seq}"
+        # Sequence per innermost section so subsections get their own
+        # claim numbering; the readable claim_id keeps the top-level
+        # letter prefix so existing single-level outlines are unchanged
+        # (``cl.c.1``), while nested sections get an underscore-joined
+        # path (``cl.c_1.1``) — unambiguous and sorts naturally.
+        innermost_id = section.section_id  # e.g. "s.c" or "s.c.1"
+        state["claim_seq_per_section"].setdefault(innermost_id, 0)
+        state["claim_seq_per_section"][innermost_id] += 1
+        seq = state["claim_seq_per_section"][innermost_id]
+        section_key = innermost_id.removeprefix("s.").replace(".", "_")
+        claim_id = f"cl.{section_key}.{seq}"
         state["source_order_seq"] += 1
         claim_source_order = state["source_order_seq"]
 

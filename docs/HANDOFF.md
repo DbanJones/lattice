@@ -1,5 +1,7 @@
 # Handoff: Build Order and Working Notes
 
+> **Status note (2026-04-30):** the original handoff sequence below has been completed and the implementation has moved beyond it. For an accurate description of what runs today — including the web UI, activity model, lit-gaps, restructure, review, and compare features — read [`../README.md`](../README.md) first. This document remains useful as a record of the build order that got us here, and as a checklist for re-implementing in a different runtime.
+
 This document is the bridge between the spec and the code. Read `SPEC.md` first.
 
 ## How to use this document

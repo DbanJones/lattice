@@ -2,6 +2,14 @@
 
 All commands take a project path as the first positional argument. Most also take `--voice <name>` to specify which voice to use.
 
+> The web UI is the primary surface in current builds (`lattice serve`). Most CLI commands have a more discoverable counterpart on the Activities tab. See [`../README.md`](../README.md) for the activity model. CLI commands below remain available for scripting and CI.
+
+## Web UI
+
+### `lattice serve [--projects-root <path>] [--host 127.0.0.1] [--port 5173]`
+
+Start the FastAPI app. Defaults to projects root `~/lattice/`, host `127.0.0.1`, port `5173`. Open the printed URL in a browser.
+
 ## Lifecycle commands
 
 ### `lattice init <project>`

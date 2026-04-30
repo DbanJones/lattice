@@ -39,6 +39,16 @@ from pydantic import BaseModel
 
 from .. import __version__ as LATTICE_VERSION
 from ..graph.store import GraphStore
+from .activities import (
+    ActivityRequest,
+    ActivityVerb,
+    project_state,
+    read_activity_history,
+    run_activity,
+)
+from ..compare import compare_projects
+from ..utils.config import Config
+from ..utils.llm import ClaudeClient, claude_available
 from .runner import (
     EventQueueProgress,
     RunRequest,
@@ -76,7 +86,9 @@ class _RunState:
     """Tracks a running or finished pipeline so the WebSocket can attach
     after the run was kicked off via POST."""
 
-    def __init__(self, run_id: str, request: RunRequest) -> None:
+    def __init__(
+        self, run_id: str, request: "RunRequest | ActivityRequest"
+    ) -> None:
         self.run_id = run_id
         self.request = request
         self.events: list[dict[str, Any]] = []
@@ -118,6 +130,36 @@ class RunStartResponse(BaseModel):
     run_id: str
     project: str
     level: str
+
+
+class ActivityStartRequest(BaseModel):
+    """Inputs for ``POST /api/projects/{name}/activities/{verb}``.
+
+    All fields are optional with sensible defaults; only the activity
+    verb (path param) and the voice are required.
+    """
+    voice: str = "academic"
+    mode: str = "thorough"  # fast | thorough
+    reference_path: str | None = None  # find_gaps only
+    max_passes: int = 3                 # refine only
+    chunk_min: int = 3                  # draft only
+    chunk_max: int = 4                  # draft only
+    force: bool = False                 # draft only
+    nesting_depth: int = 2              # scaffold only — 1=flat, 2=##, 3=###
+
+
+class ActivityStartResponse(BaseModel):
+    run_id: str
+    project: str
+    verb: str
+    mode: str
+
+
+class CompareRequest(BaseModel):
+    """Inputs for ``POST /api/compare`` — two project names to compare."""
+    project_a: str
+    project_b: str
+    mode: str = "thorough"  # fast | thorough
 
 
 class CreateProjectRequest(BaseModel):
@@ -607,6 +649,126 @@ def create_app(projects_root: Path | None = None) -> FastAPI:
         state.task = asyncio.create_task(_drive())
         return RunStartResponse(run_id=run_id, project=name, level=body.level)
 
+    # ─── activities (replaces level-based runs) ─────
+
+    @app.get("/api/projects/{name}/state")
+    async def get_project_state(name: str) -> dict[str, Any]:
+        """Return current pipeline state (S0–S4) and per-activity blockers.
+
+        The frontend uses this single payload to decide which activity
+        cards to render as ready vs. locked, and to show the right
+        unlock message on locked cards."""
+        path = _project_path(name)
+        state = project_state(path)
+        state["history"] = read_activity_history(path)
+        return state
+
+    @app.post("/api/projects/{name}/activities/{verb}")
+    async def start_activity(
+        name: str, verb: str, body: ActivityStartRequest,
+    ) -> ActivityStartResponse:
+        """Start an activity run. Streams progress via the existing
+        ``/runs/{run_id}`` WebSocket — the run_id is shared across both
+        legacy and activity runs so the frontend uses one connection."""
+        path = _project_path(name)
+        if verb not in (
+            "ingest", "scaffold", "draft", "find_gaps", "refine",
+            "restructure", "review",
+        ):
+            raise HTTPException(400, f"Unknown activity verb: {verb}")
+        if body.mode not in ("fast", "thorough"):
+            raise HTTPException(400, f"Unknown mode: {body.mode}")
+
+        # find_gaps no longer needs a reference_path — it now does
+        # per-section literature-gap analysis using the scaffold itself.
+        # The reference_path field is retained on the request for
+        # backward compatibility but ignored.
+        ref_path = Path(body.reference_path) if body.reference_path else None
+
+        run_id = uuid.uuid4().hex[:12]
+        nesting = max(1, min(3, int(body.nesting_depth)))  # clamp to 1..3
+        request = ActivityRequest(
+            project_path=path,
+            voice_name=body.voice,
+            verb=verb,  # type: ignore[arg-type]
+            mode=body.mode,  # type: ignore[arg-type]
+            reference_path=ref_path,
+            max_passes=body.max_passes,
+            chunk_min=body.chunk_min,
+            chunk_max=body.chunk_max,
+            force=body.force,
+            nesting_depth=nesting,
+        )
+        state = _RunState(run_id, request)
+        _RUNS[run_id] = state
+
+        progress = EventQueueProgress(state.queue)
+
+        async def _drive() -> None:
+            try:
+                await run_activity(request, progress)
+            except Exception as exc:  # noqa: BLE001
+                import traceback
+                tb = "".join(traceback.format_exception(exc))
+                state.queue.put_nowait({
+                    "type": "run_failed",
+                    "reason": "exception",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                    "traceback": tb,
+                })
+            finally:
+                state.finished = True
+
+        state.task = asyncio.create_task(_drive())
+        return ActivityStartResponse(
+            run_id=run_id, project=name, verb=verb, mode=body.mode,
+        )
+
+    # ─── compare (cross-project) ───────────────
+
+    @app.post("/api/compare")
+    async def compare_two_projects(body: CompareRequest) -> dict[str, Any]:
+        """Compare two projects' scaffolds. Synchronous: one or two LLM
+        calls in ``thorough`` mode, no LLM in ``fast`` mode.
+
+        The frontend should show a spinner while this runs — typical
+        wall time is under a minute even for thorough mode."""
+        if body.mode not in ("fast", "thorough"):
+            raise HTTPException(400, f"Unknown mode: {body.mode}")
+        if body.project_a == body.project_b:
+            raise HTTPException(
+                400, "Cannot compare a project with itself."
+            )
+        path_a = _project_path(body.project_a)
+        path_b = _project_path(body.project_b)
+        for label, path in (("A", path_a), ("B", path_b)):
+            if not (path / ".lattice" / "author_graph.json").exists():
+                raise HTTPException(
+                    400,
+                    f"Project {label} ({path.name}) has no author_graph.json — "
+                    f"run Scaffold first.",
+                )
+
+        llm: ClaudeClient | None = None
+        if body.mode == "thorough":
+            if not claude_available():
+                raise HTTPException(
+                    400,
+                    "Thorough compare needs Claude CLI on PATH; "
+                    "use mode='fast' for a structural-only report.",
+                )
+            # Use the first project's config for model selection.
+            cfg = Config.load(path_a)
+            llm = ClaudeClient(
+                default_model=cfg.default_model,
+                parallel=cfg.parallel_renders,
+            )
+
+        report = await compare_projects(
+            path_a, path_b, llm=llm, mode=body.mode,  # type: ignore[arg-type]
+        )
+        return report.model_dump()
+
     @app.websocket("/api/projects/{name}/runs/{run_id}")
     async def run_events(websocket: WebSocket, name: str, run_id: str) -> None:
         await websocket.accept()
@@ -682,6 +844,46 @@ def create_app(projects_root: Path | None = None) -> FastAPI:
         if not path.exists():
             raise HTTPException(404, "No source-gap review.")
         return json.loads(path.read_text(encoding="utf-8"))
+
+    @app.get("/api/projects/{name}/lit-gaps")
+    async def get_lit_gaps(name: str, voice: str = "academic") -> dict[str, Any]:
+        """Return the per-section literature-gap report (canonical
+        works the section misses, counter-arguments not addressed,
+        recent papers bearing on the claims). Produced by the
+        ``find_gaps`` activity."""
+        path = _project_path(name) / "outputs" / f"lit_gaps.{voice}.json"
+        if not path.exists():
+            raise HTTPException(404, "No lit-gaps report yet — run Find gaps first.")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    @app.get("/api/projects/{name}/restructure")
+    async def get_restructure(name: str, voice: str = "academic") -> dict[str, Any]:
+        """Return the structural-analysis report. Produced by the
+        ``restructure`` activity."""
+        path = _project_path(name) / "outputs" / f"restructure.{voice}.json"
+        if not path.exists():
+            raise HTTPException(404, "No restructure report yet — run Restructure first.")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    @app.get("/api/projects/{name}/review")
+    async def get_review(name: str, voice: str = "academic") -> dict[str, Any]:
+        """Return the supervisor review (overall + section + per-cluster
+        revisions). Produced by the ``review`` activity."""
+        path = _project_path(name) / "outputs" / f"review.{voice}.json"
+        if not path.exists():
+            raise HTTPException(404, "No review yet — run Review first.")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    @app.get("/api/projects/{name}/review-track-changes")
+    async def get_review_track_changes(name: str, voice: str = "academic") -> PlainTextResponse:
+        """Return the track-changes markdown paper as plain text."""
+        path = (
+            _project_path(name) / "outputs"
+            / f"review_track_changes.{voice}.md"
+        )
+        if not path.exists():
+            raise HTTPException(404, "No track-changes paper — run Review first.")
+        return PlainTextResponse(path.read_text(encoding="utf-8"))
 
     @app.get("/api/projects/{name}/voice-review")
     async def get_voice_review(name: str, voice: str = "academic") -> PlainTextResponse:
@@ -2003,6 +2205,15 @@ def create_app(projects_root: Path | None = None) -> FastAPI:
                 "title": s.get("title"),
                 "role": s.get("role"),
                 "position": s.get("position"),
+                "parent": s.get("parent"),
+                # ``depth`` is derived from the section_id path so the
+                # frontend can indent without rebuilding the tree from
+                # scratch. ``s.c`` = 0, ``s.c.1`` = 1, ``s.c.1.2`` = 2.
+                # The ``s.thesis`` pseudo-section stays at depth 0.
+                "depth": (
+                    0 if s["section_id"] in ("s.thesis",)
+                    else max(0, s["section_id"].count(".") - 1)
+                ),
                 "clusters": section_clusters,
                 # Surface claims with no cluster too (orphans).
                 "orphan_claim_count": len([

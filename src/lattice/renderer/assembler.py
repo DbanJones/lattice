@@ -170,7 +170,16 @@ class Assembler:
             groups.pop()
 
         clusters: list[Cluster] = []
-        section_letter = section.section_id.removeprefix("s.") or "x"
+        # ``section_letter`` is used as the readable cluster-id prefix.
+        # For top-level sections (``s.c``) this stays just the letter
+        # (``c``), preserving the existing ``c.c.<seq>`` ids. Nested
+        # sections (``s.c.1``) collapse their inner dots to underscores
+        # so cluster ids stay unambiguous (``c.c_1.<seq>``) and don't
+        # collide with the top-level ``c.c.1`` cluster.
+        section_letter = (
+            section.section_id.removeprefix("s.").replace(".", "_")
+            or "x"
+        )
 
         for seq, group in enumerate(groups, start=1):
             roles = [_role_for_claim(c) for c in group]
