@@ -1,0 +1,27 @@
+# Lattice project configuration.
+# See docs/CLI.md for full reference.
+
+default_voice: academic
+
+default_model: claude-sonnet-4-5
+
+model_per_stage:
+  ingester: claude-sonnet-4-5
+  enricher: claude-sonnet-4-5
+  shadow_extractor: claude-sonnet-4-5
+  shadow_architect: claude-sonnet-4-5
+  renderer: claude-sonnet-4-5
+  auditor: claude-sonnet-4-5
+  examiner: claude-opus-4-7
+  edit_proposer: claude-sonnet-4-5
+
+parallel_renders: 8
+
+# Cache and output directories (relative to project root)
+cache_dir: .lattice/cache
+output_dir: outputs
+
+# Voice-specific overrides (optional)
+# voice_overrides:
+#   journalistic:
+#     parallel_renders: 4   # Lower concurrency for tighter rhythm work

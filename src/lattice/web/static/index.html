@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Lattice</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="preconnect" href="https://rsms.me/" />
+  <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <a href="#" data-route="projects" class="brand-link">
+        <svg class="brand-mark" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2 L4 7 L4 17 L12 22 L20 17 L20 7 Z" />
+          <path d="M12 2 L12 12 M4 7 L12 12 M20 7 L12 12 M12 22 L12 12" />
+        </svg>
+        <span>Lattice</span>
+      </a>
+      <span id="breadcrumb" class="breadcrumb"></span>
+    </div>
+    <div class="topbar-actions">
+      <span id="server-version" class="version-tag" title="Lattice version"></span>
+      <span id="server-status" class="pill ok">Connected</span>
+    </div>
+  </header>
+
+  <main id="app">
+    <!-- View content rendered by JS into here -->
+  </main>
+
+  <!-- Templates rendered by JS -->
+  <template id="tpl-projects-list">
+    <div class="container">
+      <div class="page-head">
+        <div>
+          <h1>Projects</h1>
+          <p class="lede">Each project is a folder under <code class="path-pill" data-bind="root"></code>. Pick one to review its hierarchy, drafts, and outputs.</p>
+        </div>
+        <div class="page-actions">
+          <button class="btn primary" data-action="new-project">+ New project</button>
+        </div>
+      </div>
+      <div class="project-grid" data-bind="grid"></div>
+    </div>
+  </template>
+
+  <template id="tpl-new-project-modal">
+    <div class="modal-backdrop">
+      <div class="modal">
+        <div class="modal-head">
+          <h2>New project</h2>
+          <button class="btn-ghost" data-action="close">✕</button>
+        </div>
+        <form class="modal-body" data-bind="form">
+          <label class="field">
+            <span class="field-label">Project name</span>
+            <input type="text" name="name" required maxlength="120" placeholder="Extraneous factors in judicial decisions" autocomplete="off" data-bind="name-input" />
+            <span class="muted small">Up to 120 characters. Spaces and punctuation OK — saved to folder <code class="path-pill" data-bind="folder-preview">my_paper</code>.</span>
+          </label>
+          <label class="field">
+            <span class="field-label">Voice</span>
+            <select name="voice">
+              <option value="academic">academic</option>
+              <option value="journalistic">journalistic</option>
+              <option value="policy">policy</option>
+            </select>
+          </label>
+          <div class="field">
+            <span class="field-label">Outline</span>
+            <div class="dropzone" data-bind="outline-drop">
+              <div class="dropzone-prompt">
+                <svg class="dropzone-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
+                </svg>
+                <span><strong>Drop a file here</strong> or
+                  <label class="dropzone-link">
+                    browse
+                    <input type="file" name="outline_file" accept=".md,.markdown,.txt,.docx,.pdf" hidden data-bind="outline-file-input" />
+                  </label>
+                </span>
+                <span class="muted small dropzone-hint">.md, .txt, .docx, or .pdf (PDF text is extracted into the editor below)</span>
+              </div>
+              <div class="dropzone-selected hidden">
+                <span data-bind="outline-file-label"></span>
+                <button type="button" class="btn-ghost sm" data-action="clear-outline-file">Clear</button>
+              </div>
+            </div>
+            <textarea name="outline" rows="12" placeholder="# THESIS&#10;&#10;[Your thesis in one sentence.]&#10;&#10;# A. First section&#10;&#10;  - First claim [ref: source_id]&#10;  - MY VIEW: Your synthesis [user_synthesis]"></textarea>
+            <span class="muted small">Bullet syntax: <code>- claim text [tag] [ref: source_id]</code>. Markdown/text/PDF text is editable above; <code>.docx</code> is uploaded as-is and parsed at ingest time.</span>
+          </div>
+
+          <div class="field">
+            <span class="field-label">Supporting documents <span class="muted small">(optional)</span></span>
+            <div class="dropzone" data-bind="source-drop">
+              <div class="dropzone-prompt">
+                <svg class="dropzone-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
+                </svg>
+                <span><strong>Drop files here</strong> or
+                  <label class="dropzone-link">
+                    browse
+                    <input type="file" name="source_files" multiple accept=".pdf,.docx,.md,.markdown,.txt,.html,.htm,.xlsx" hidden data-bind="source-files-input" />
+                  </label>
+                </span>
+                <span class="muted small dropzone-hint">PDF · DOCX · Markdown · TXT · HTML · XLSX, up to 200 MB each</span>
+              </div>
+            </div>
+            <div class="upload-row" style="margin-top: 8px;">
+              <label class="muted small" style="display: flex; align-items: center; gap: 6px;">
+                Send files to bucket
+                <select name="source_bucket" data-bind="source-bucket">
+                  <option value="papers">papers (peer-reviewed)</option>
+                  <option value="prior_writing">prior_writing (your own work)</option>
+                  <option value="notes">notes (your reading notes)</option>
+                  <option value="data">data (spreadsheets)</option>
+                  <option value="web">web (archived pages)</option>
+                </select>
+              </label>
+            </div>
+            <ul class="upload-list" data-bind="source-list"></ul>
+          </div>
+
+          <label class="field-check">
+            <input type="checkbox" name="ingest_now" checked />
+            <span>Ingest the outline now (parse claims, build cluster plan)</span>
+          </label>
+          <div class="modal-actions">
+            <button type="button" class="btn" data-action="close">Cancel</button>
+            <button type="submit" class="btn primary">Create project</button>
+          </div>
+          <p class="modal-error muted small" data-bind="error"></p>
+        </form>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-project-card">
+    <div class="project-card">
+      <div class="card-head">
+        <h3 data-bind="name"></h3>
+        <span class="pill" data-bind="status"></span>
+      </div>
+      <p class="muted small mono" data-bind="path"></p>
+      <div class="card-stats">
+        <div class="stat"><span class="stat-num" data-bind="words"></span><span class="stat-label">words</span></div>
+        <div class="stat"><span class="stat-num" data-bind="last"></span><span class="stat-label">last render</span></div>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-project-detail">
+    <div class="container">
+      <div class="page-head">
+        <div>
+          <h1 data-bind="name"></h1>
+          <p class="lede" data-bind="thesis"></p>
+        </div>
+        <div class="page-actions" data-bind="header-actions"></div>
+      </div>
+      <div class="status-strip" data-bind="status-strip"></div>
+      <nav class="subnav">
+        <button class="subnav-tab active" data-section="dashboard">Dashboard</button>
+        <button class="subnav-tab" data-section="outline">Outline</button>
+        <button class="subnav-tab" data-section="sources">Sources</button>
+        <button class="subnav-tab" data-section="references">References</button>
+        <button class="subnav-tab" data-section="review">Review</button>
+      </nav>
+      <div class="subnav-body">
+        <section class="subnav-panel visible" data-panel="dashboard" data-bind="dashboard"></section>
+        <section class="subnav-panel" data-panel="outline" data-bind="outline"></section>
+        <section class="subnav-panel" data-panel="sources" data-bind="sources"></section>
+        <section class="subnav-panel" data-panel="references" data-bind="references"></section>
+        <section class="subnav-panel" data-panel="review" data-bind="review"></section>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-run-form">
+    <div class="run-wrapper">
+    <form class="run-form">
+      <div class="card">
+        <h3>Review level</h3>
+        <p class="muted small">Each level adds more checks. Quick is fastest; deep includes the convergence loop and an optional source-gap review against a reference document.</p>
+        <div class="level-options">
+          <label class="level-option">
+            <input type="radio" name="level" value="quick" />
+            <div class="level-card">
+              <div class="level-head">
+                <span class="level-name">Quick</span>
+                <span class="level-time">~5 min</span>
+              </div>
+              <p class="level-desc">Render only.</p>
+              <div class="level-features"><span>Render</span></div>
+            </div>
+          </label>
+          <label class="level-option">
+            <input type="radio" name="level" value="standard" checked />
+            <div class="level-card">
+              <div class="level-head">
+                <span class="level-name">Standard</span>
+                <span class="level-time">~15 min</span>
+              </div>
+              <p class="level-desc">Render plus full audit and voice review. No autocorrect.</p>
+              <div class="level-features"><span>Render</span><span>Audit</span><span>Voice review</span></div>
+            </div>
+          </label>
+          <label class="level-option">
+            <input type="radio" name="level" value="deep" />
+            <div class="level-card">
+              <div class="level-head">
+                <span class="level-name">Deep</span>
+                <span class="level-time">~45 min</span>
+              </div>
+              <p class="level-desc">Convergence loop with autocorrect aggressive plus source-gap review against a reference document.</p>
+              <div class="level-features"><span>Render</span><span>Audit</span><span>Autocorrect</span><span>Source-gap</span><span>Voice review</span></div>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <details class="card advanced">
+        <summary>Advanced options</summary>
+        <div class="form-grid">
+          <label class="field">
+            <span class="field-label">Voice</span>
+            <select name="voice" data-bind="voice-select"></select>
+          </label>
+          <label class="field">
+            <span class="field-label">Reference document <span class="muted small">(deep only)</span></span>
+            <input type="text" name="reference_path" placeholder="absolute path to reference markdown" />
+          </label>
+          <label class="field">
+            <span class="field-label">Max passes</span>
+            <input type="number" name="max_passes" value="3" min="1" max="6" />
+          </label>
+          <label class="field">
+            <span class="field-label">Chunk min</span>
+            <input type="number" name="chunk_min" value="3" min="1" max="10" />
+          </label>
+          <label class="field">
+            <span class="field-label">Chunk max</span>
+            <input type="number" name="chunk_max" value="4" min="1" max="20" />
+          </label>
+          <label class="field-check">
+            <input type="checkbox" name="force" />
+            <span>Force re-render every cluster</span>
+          </label>
+        </div>
+      </details>
+
+      <div class="run-actions">
+        <button type="submit" class="btn primary lg">Start review</button>
+        <span class="muted small">Pipeline runs locally against your Claude Code subscription.</span>
+      </div>
+    </form>
+
+    <div class="run-status hidden" data-bind="status">
+      <div class="card status-card">
+        <div class="status-head">
+          <h3>Live progress</h3>
+          <div class="status-pills">
+            <span class="pill mono" data-bind="run-id"></span>
+            <span class="pill mono" data-bind="pass">Pass 1</span>
+            <span class="pill mono" data-bind="elapsed">0s</span>
+            <span class="pill running" data-bind="state">running</span>
+          </div>
+        </div>
+        <ol class="timeline" data-bind="timeline"></ol>
+        <div class="run-summary hidden" data-bind="summary"></div>
+      </div>
+    </div>
+    </div>
+  </template>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked@14.1.4/marked.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

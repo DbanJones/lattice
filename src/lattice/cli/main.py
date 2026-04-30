@@ -1,0 +1,1549 @@
+"""Lattice CLI entry point.
+
+See docs/CLI.md for the full command reference.
+See docs/HANDOFF.md step 4 for the build order.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Windows: force UTF-8 stdout/stderr so Rich progress glyphs (→, ┌, etc.)
+# don't crash the legacy Windows console renderer with cp1252
+# UnicodeEncodeError. No-op on POSIX. Must run before any Rich Console
+# is constructed.
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+import asyncio
+
+from ..auditor.consistency import VoiceConsistencyCheck
+from ..auditor.runner import AuditRunner
+from ..auditor.voice_review import review_document as voice_review_document
+from ..differ.diff import Differ
+from ..editor.applier import EditApplier
+from ..editor.proposer import EditProposer
+from ..enricher.binder import Enricher
+from ..enricher.report import EnrichmentReporter
+from ..tui.coverage_review import CoverageReviewTUI
+from ..graph.export_argus import export_to_argus
+from ..graph.models import AuthorGraph
+from ..graph.store import GraphStore
+from ..indexer.base import SourceIndexer
+from ..ingester.annotator import ContextualAnnotator
+from ..ingester.docx import DOCXOutlineIngester
+from ..ingester.markdown import MarkdownOutlineIngester
+from ..renderer.assembler import Assembler
+from ..renderer.assembler_finalise import DocumentFinaliser
+from ..renderer.chunked_renderer import ChunkedRenderer
+from ..renderer.cluster_renderer import ClusterRenderer
+from ..output.visualise import render_tree, write_html, write_mermaid
+from ..renderer.parallel import ParallelRenderer
+from ..shadow import ShadowMapper
+from ..utils.config import Config
+from ..utils.llm import ClaudeClient, claude_available
+from ..utils.resume import ResumeManager, StageStatus
+from ..voice.parser import Voice
+from .run import PipelineRunner
+
+
+def _load_voice(project: Path, voice_name: str) -> Voice:
+    voice_path = project / "voices" / f"{voice_name}.voice.md"
+    if not voice_path.exists():
+        console.print(f"[red]Voice not found: {voice_path}[/red]")
+        raise typer.Exit(code=3)
+    return Voice.from_file(voice_path)
+
+
+def _require_project(project: Path) -> Path:
+    project = project.resolve()
+    if not project.exists():
+        console.print(f"[red]Project not found: {project}[/red]")
+        raise typer.Exit(code=3)
+    return project
+
+
+def _require_claude() -> None:
+    if not claude_available():
+        console.print(
+            "[red]Claude Code CLI not found. Install Claude Code so `claude` "
+            "is on PATH, or set LATTICE_CLAUDE_CMD to the binary path.[/red]"
+        )
+        raise typer.Exit(code=2)
+
+app = typer.Typer(
+    name="lattice",
+    help="Argument-first long-form writing tool. See docs/SPEC.md.",
+    no_args_is_help=True,
+)
+
+console = Console()
+
+
+# ─────────────────────────────────────────────────────────
+# Helpers for asset discovery
+# ─────────────────────────────────────────────────────────
+
+
+def _package_examples_dir() -> Path | None:
+    """Locate the lattice repo's examples/ directory for template discovery.
+
+    Works when installed editable from the repo. Returns None otherwise.
+    """
+    # src/lattice/cli/main.py -> parents[3] is the repo root.
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / "examples"
+        if (candidate / "voices" / "academic.voice.md").exists():
+            return candidate
+    return None
+
+
+_DEFAULT_OUTLINE = """# THESIS
+[TODO: state your thesis in one sentence.]
+
+# A. [TODO: first section heading]
+  - [TODO: first bullet] [ref: source_id]
+  - MY VIEW: [TODO: your synthesis claim] [user_synthesis]
+"""
+
+_DEFAULT_CONFIG = """# Lattice project configuration.
+# See docs/CLI.md for full reference.
+#
+# Models are passed through to `claude --model <value>`. Use Claude Code
+# aliases ('sonnet', 'opus', 'haiku') or full model IDs.
+
+default_voice: academic
+
+default_model: sonnet
+
+model_per_stage:
+  ingester: sonnet
+  enricher: sonnet
+  shadow_extractor: sonnet
+  shadow_architect: sonnet
+  renderer: sonnet
+  auditor: sonnet
+  examiner: opus
+  edit_proposer: sonnet
+
+# Lower than the old HTTP default — each call is a subprocess to `claude`.
+parallel_renders: 4
+cache_dir: .lattice/cache
+output_dir: outputs
+"""
+
+_DEFAULT_GITIGNORE = """# Lattice state
+.lattice/
+outputs/
+
+# Env
+.env
+"""
+
+
+# ─────────────────────────────────────────────────────────
+# Commands
+# ─────────────────────────────────────────────────────────
+
+
+@app.command()
+def init(
+    project: Path = typer.Argument(..., help="Path to the new project folder."),
+) -> None:
+    """Scaffold a new Lattice project with default folders and config."""
+    project = project.resolve()
+    if project.exists() and any(project.iterdir()):
+        console.print(f"[yellow]{project} already exists and is not empty. Aborting.[/yellow]")
+        raise typer.Exit(code=3)
+
+    for sub in [
+        "structure",
+        "refs/papers",
+        "refs/notes",
+        "refs/data",
+        "refs/prior_writing",
+        "refs/web",
+        "voices",
+        "figures",
+    ]:
+        (project / sub).mkdir(parents=True, exist_ok=True)
+
+    (project / "config.yml").write_text(_DEFAULT_CONFIG, encoding="utf-8")
+    (project / ".gitignore").write_text(_DEFAULT_GITIGNORE, encoding="utf-8")
+    (project / "structure" / "outline.md").write_text(_DEFAULT_OUTLINE, encoding="utf-8")
+
+    examples = _package_examples_dir()
+    if examples is not None:
+        shutil.copy2(examples / "voices" / "academic.voice.md", project / "voices" / "academic.voice.md")
+    else:
+        # Minimal fallback — signal to the user they need to author a voice.
+        (project / "voices" / "academic.voice.md").write_text(
+            "# TODO: populate academic.voice.md from examples/voices/academic.voice.md\n",
+            encoding="utf-8",
+        )
+
+    GraphStore.load(project)  # creates .lattice/
+
+    console.print(f"[green]Initialised project at {project}[/green]")
+    console.print("Next: drop references into refs/ and run [bold]lattice index[/bold].")
+
+
+@app.command()
+def status(
+    project: Path = typer.Argument(..., help="Path to project."),
+) -> None:
+    """Show current project state: indexed sources, claims, last runs, pending flags."""
+    project = project.resolve()
+    if not project.exists():
+        console.print(f"[red]Project not found: {project}[/red]")
+        raise typer.Exit(code=3)
+
+    store = GraphStore.load(project)
+    graph = store.get_graph()
+    sources = store.list_sources()
+
+    def _mtime(path: Path) -> str:
+        if not path.exists():
+            return "—"
+        dt = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+
+    table = Table(title=f"Lattice project: {project.name}")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value")
+
+    table.add_row("Indexed sources", str(len(sources)))
+    table.add_row("Claims", str(len(graph.claims)))
+    table.add_row("Sections", str(len(graph.sections)))
+    table.add_row("Relationships", str(len(graph.relationships)))
+    table.add_row("Clusters", str(len(store.list_clusters())))
+    table.add_row("Last author_graph update", _mtime(store.author_graph_path))
+    table.add_row("Last source_store update", _mtime(store.source_store_path))
+    table.add_row("Last cluster_plan update", _mtime(store.cluster_plan_path))
+    table.add_row("Last audit_flags update", _mtime(store.audit_flags_path))
+
+    # Pending flag summary by voice
+    pending_by_voice: dict[str, int] = {}
+    if store.audit_flags_path.exists():
+        data = json.loads(store.audit_flags_path.read_text(encoding="utf-8"))
+        for voice_name, flags in data.items():
+            pending = sum(1 for f in flags if not f.get("decision"))
+            if pending:
+                pending_by_voice[voice_name] = pending
+    if pending_by_voice:
+        for voice_name, count in pending_by_voice.items():
+            table.add_row(f"Pending flags ({voice_name})", str(count))
+    else:
+        table.add_row("Pending flags", "0")
+
+    console.print(table)
+
+
+@app.command()
+def ingest(project: Path = typer.Argument(...)) -> None:
+    """Rebuild author_graph from structure/. Auto-detects format by extension."""
+    project = project.resolve()
+    if not project.exists():
+        console.print(f"[red]Project not found: {project}[/red]")
+        raise typer.Exit(code=3)
+
+    structure_dir = project / "structure"
+    annotated = structure_dir / "outline.annotated.md"
+    if annotated.exists():
+        structure_file = annotated
+    else:
+        candidates = (
+            list(structure_dir.glob("*.md"))
+            + list(structure_dir.glob("*.docx"))
+            + list(structure_dir.glob("*.argus.json"))
+        )
+        candidates = [
+            p for p in candidates
+            if p.is_file()
+            and not p.name.startswith("~$")
+            and not p.name.endswith(".original.docx")
+        ]
+        if not candidates:
+            console.print(f"[red]No structure file found in {structure_dir}/[/red]")
+            raise typer.Exit(code=3)
+        structure_file = candidates[0]
+
+    config = Config.load(project)
+    store = GraphStore.load(project)
+
+    suffix = structure_file.suffix.lower()
+    if suffix == ".json":
+        console.print("[yellow]Argus ingester not yet implemented.[/yellow]")
+        raise typer.Exit(code=3)
+    if suffix == ".docx":
+        ingester: object = DOCXOutlineIngester(config)
+    else:
+        ingester = MarkdownOutlineIngester(config)
+    graph = asyncio.run(ingester.ingest(structure_file, project_name=project.name))
+
+    # Contextual annotation: thesis extraction + section-role classification
+    # + claim-role inference + inline-citation detection. Uses Claude CLI if
+    # available; falls back to deterministic citation regex only if not.
+    llm = None
+    if claude_available():
+        try:
+            llm = ClaudeClient(default_model=config.default_model, parallel=config.parallel_renders)
+        except Exception:
+            llm = None
+    if llm is not None:
+        console.print("[dim]Annotating (thesis, section roles, claim roles, citations)...[/dim]")
+    else:
+        console.print("[dim]Annotating (inline citations only; install Claude for full annotation)...[/dim]")
+
+    known_sources = {s.source_id for s in store.list_sources()}
+    annotator = ContextualAnnotator(config, llm)
+    graph = asyncio.run(annotator.annotate(graph, known_source_ids=known_sources))
+
+    store.save_graph(graph)
+
+    # Post-annotation summary so the user sees what was inferred.
+    references_sections = [s for s in graph.sections if s.role.value == "references"]
+    with_evidence = sum(1 for c in graph.claims if c.evidence)
+    with_roles = sum(1 for c in graph.claims if any(t.startswith("role:") for t in c.tags))
+    user_synth = sum(1 for c in graph.claims if c.type.value == "user_synthesis")
+
+    console.print(
+        f"[green]Ingested {len(graph.sections)} sections, "
+        f"{len(graph.claims)} claims, "
+        f"{len(graph.relationships)} relationships.[/green]"
+    )
+    console.print(
+        f"  thesis: {(graph.thesis_statement or '(none)')[:120]}"
+    )
+    console.print(
+        f"  annotations — references sections skipped: {len(references_sections)}, "
+        f"claims with evidence: {with_evidence}, "
+        f"claims with roles: {with_roles}, "
+        f"user_synthesis: {user_synth}"
+    )
+
+
+@app.command()
+def index(
+    project: Path = typer.Argument(...),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Rebuild source_store from refs/. Skips files whose SHA256 is unchanged."""
+    project = project.resolve()
+    if not project.exists():
+        console.print(f"[red]Project not found: {project}[/red]")
+        raise typer.Exit(code=3)
+
+    Config.load(project)  # validates config; unused locally yet
+    store = GraphStore.load(project)
+    indexer = SourceIndexer(project)
+    sources, skipped = indexer.index_all(force=force)
+
+    for src in sources:
+        store.save_source(src)
+
+    console.print(
+        f"[green]Indexed {len(sources)} source(s), skipped {len(skipped)} unchanged.[/green]"
+    )
+    if sources:
+        table = Table(title="Indexed")
+        table.add_column("source_id", style="cyan")
+        table.add_column("type")
+        table.add_column("passages")
+        for src in sources:
+            table.add_row(src.source_id, src.type.value, str(len(src.passages)))
+        console.print(table)
+
+
+@app.command()
+def enrich(project: Path = typer.Argument(...)) -> None:
+    """Bind author claims to source passages. One LLM call per (claim, source)."""
+    project = project.resolve()
+    if not project.exists():
+        console.print(f"[red]Project not found: {project}[/red]")
+        raise typer.Exit(code=3)
+
+    config = Config.load(project)
+    store = GraphStore.load(project)
+    _require_claude()
+
+    llm = ClaudeClient(
+        api_key=config.api_key,
+        default_model=config.default_model,
+        parallel=config.parallel_renders,
+    )
+    enricher = Enricher(config, store, llm)
+    count = asyncio.run(enricher.enrich_all())
+    console.print(f"[green]Enriched {count} claim(s).[/green]")
+
+
+@app.command()
+def shadow(
+    project: Path = typer.Argument(...),
+    blind: bool = typer.Option(False, "--blind", help="Shadow mapper ignores thesis."),
+) -> None:
+    """Build shadow graph and report. Requires ANTHROPIC_API_KEY."""
+    project = _require_project(project)
+    config = Config.load(project)
+    _require_claude()
+    store = GraphStore.load(project)
+    graph = store.get_graph()
+    sources = store.list_sources()
+    if not sources:
+        console.print("[red]No sources indexed. Run `lattice index` first.[/red]")
+        raise typer.Exit(code=3)
+    llm = ClaudeClient(
+        api_key=config.api_key,
+        default_model=config.default_model,
+        parallel=config.parallel_renders,
+    )
+    thesis = "" if blind else (graph.thesis_statement or "")
+    shadow_graph = asyncio.run(ShadowMapper(config, llm).build(sources, thesis))
+    shadow_path = project / ".lattice" / "shadow_graph.json"
+    shadow_path.write_text(shadow_graph.model_dump_json(indent=2), encoding="utf-8")
+
+    differ = Differ(project)
+    diffs = differ.diff(graph, shadow_graph, sources=sources)
+    report_path = differ.write_report(diffs)
+    console.print(
+        f"[green]Shadow graph: {len(shadow_graph.claims)} claims across "
+        f"{len(shadow_graph.sections)} clusters. {len(diffs)} flag(s) in report.[/green]"
+    )
+    console.print(f"Report: {report_path}")
+
+
+@app.command()
+def review(
+    project: Path = typer.Argument(...),
+    accept: str | None = typer.Option(None, "--accept"),
+    reject: str | None = typer.Option(None, "--reject"),
+    rationale: str = typer.Option("", "--rationale"),
+) -> None:
+    """List shadow diffs and apply accept/reject (non-interactive)."""
+    project = _require_project(project)
+    shadow_path = project / ".lattice" / "shadow_graph.json"
+    if not shadow_path.exists():
+        console.print("[red]No shadow graph. Run `lattice shadow` first.[/red]")
+        raise typer.Exit(code=3)
+    reports_dir = project / ".lattice" / "shadow_reports"
+    reports = sorted(reports_dir.glob("*.md")) if reports_dir.exists() else []
+    if not reports:
+        console.print("[yellow]No shadow reports yet.[/yellow]")
+        return
+
+    # Decision persistence for shadow diffs is a follow-on refinement; for
+    # M5 we just surface the latest report and its full contents.
+    if accept or reject:
+        log_path = project / ".lattice" / "shadow_decisions.json"
+        import json
+        existing = json.loads(log_path.read_text(encoding="utf-8")) if log_path.exists() else []
+        entry = {
+            "diff_id": accept or reject,
+            "decision": "accept" if accept else "reject",
+            "rationale": rationale,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        existing.append(entry)
+        log_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        console.print(f"[green]Logged decision for {entry['diff_id']}[/green]")
+        return
+
+    console.print(f"Latest report: {reports[-1]}")
+    console.print(reports[-1].read_text(encoding="utf-8"))
+
+
+@app.command()
+def coverage(
+    project: Path = typer.Argument(...),
+) -> None:
+    """Review enrichment coverage. Required before render when claims are unbound.
+
+    Walks every unbound and contradictory claim and asks the author for a
+    resolution decision (mark user_synthesis, add a new source, soften, remove,
+    or accept the gap). Decisions persist in `.lattice/enrichment_coverage.json`.
+    """
+    project = _require_project(project)
+    Config.load(project)
+    store = GraphStore.load(project)
+    reporter = EnrichmentReporter(store, project)
+    report = CoverageReviewTUI(reporter).run()
+    if not report.can_proceed_to_render:
+        console.print(
+            "[yellow]Some claims still pending. Re-run `lattice coverage` "
+            "when ready.[/yellow]"
+        )
+        raise typer.Exit(code=1)
+    console.print("[green]Coverage review complete. Ready to render.[/green]")
+
+
+@app.command()
+def plan(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(..., "--voice", "-v"),
+) -> None:
+    """Build cluster plan from working graph and voice."""
+    project = _require_project(project)
+    config = Config.load(project)
+    store = GraphStore.load(project)
+    voice_obj = _load_voice(project, voice)
+
+    # Assembler cluster construction is deterministic — no LLM required.
+    assembler = Assembler(config, store, llm=None, voice=voice_obj)
+    clusters = asyncio.run(assembler.build_plan())
+    # Save graph so updated section.cluster_ids persists.
+    store.save_graph(store.get_graph())
+
+    console.print(
+        f"[green]Planned {len(clusters)} cluster(s) across "
+        f"{len({c.section_id for c in clusters})} section(s).[/green]"
+    )
+    violations = getattr(assembler, "_violations", [])
+    if violations:
+        console.print("[yellow]Architecture violations:[/yellow]")
+        for v in violations:
+            console.print(f"  - {v}")
+
+
+@app.command()
+def render(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(..., "--voice", "-v"),
+    cluster: str | None = typer.Option(None, "--cluster", help="Render single cluster only (cluster mode)."),
+    section: str | None = typer.Option(None, "--section", help="Render one section's clusters (cluster mode)."),
+    force: bool = typer.Option(False, "--force"),
+    mode: str = typer.Option(
+        "chunked", "--mode",
+        help="chunked (default, 4-5 clusters per LLM call) or cluster (one call per cluster)",
+    ),
+    chunk_min: int = typer.Option(3, "--chunk-min", help="min clusters per chunk (chunked mode)"),
+    chunk_max: int = typer.Option(4, "--chunk-max", help="max clusters per chunk (chunked mode)"),
+    max_passes: int = typer.Option(
+        3, "--max-passes",
+        help="Max autofix→re-render→finalise passes when finalise refuses. Each "
+             "pass that produces no changes (or releases the document) ends the "
+             "loop early. Set to 1 to disable convergence retries.",
+    ),
+    no_progress: bool = typer.Option(
+        False, "--no-progress",
+        help="Disable the live progress display.",
+    ),
+) -> None:
+    """Produce a rendered paper.
+
+    Default mode: ``chunked``. Groups 4-5 clusters into a single LLM call so
+    Claude sees the full argument arc and can do callbacks across clusters.
+    Output is parsed back into per-cluster prose files for downstream audit
+    and edit workflows. The 4-5 default avoids the JSON truncation observed
+    at chunk sizes >=8 with the elaboration directives applied; raise it
+    via --chunk-max if your model-stage budget is higher.
+
+    Use ``--mode cluster`` for the older one-call-per-cluster behaviour
+    (slower, more fragmented prose, tighter argument-graph traceability).
+    """
+    project = _require_project(project)
+    config = Config.load(project)
+    _require_claude()
+    store = GraphStore.load(project)
+    voice_obj = _load_voice(project, voice)
+
+    llm = ClaudeClient(
+        api_key=config.api_key,
+        default_model=config.default_model,
+        parallel=config.parallel_renders,
+    )
+
+    all_clusters = store.list_clusters()
+    if not all_clusters:
+        console.print("[red]No cluster plan found. Run `lattice plan` first.[/red]")
+        raise typer.Exit(code=3)
+
+    from .progress import progress_or_null
+
+    # The convergence loop wraps render + audit + autofix + re-render +
+    # finalise. Pass 1 is the initial render; passes 2..max_passes only
+    # run if finalise refused and autofix has work to do.
+    show_progress = not no_progress and mode == "chunked"
+    final_path: Path | None = None
+
+    with progress_or_null(
+        console, enabled=show_progress, total_passes=max_passes,
+    ) as prog:
+        prog.begin_pass(1, max_passes)
+
+        if mode == "chunked":
+            if cluster or section:
+                console.print(
+                    "[yellow]--cluster and --section are ignored in chunked mode. "
+                    "Use --mode cluster for cluster-level targeting.[/yellow]"
+                )
+            renderer = ChunkedRenderer(
+                config, store, llm, voice_obj,
+                min_chunk=chunk_min, max_chunk=chunk_max,
+            )
+            results = asyncio.run(renderer.render_all(force=force, progress=prog))
+            rendered = sum(
+                1 for r in results.values()
+                if r and "CLUSTER_UNRENDERABLE" not in r
+            )
+            console.print(f"[green]Rendered {rendered}/{len(results)} cluster(s) (chunked).[/green]")
+        elif mode == "cluster":
+            cluster_renderer = ClusterRenderer(config, store, llm, voice_obj)
+            if cluster:
+                cluster_ids = [cluster]
+            elif section:
+                cluster_ids = [c.cluster_id for c in all_clusters if c.section_id == section]
+            else:
+                cluster_ids = [c.cluster_id for c in all_clusters]
+            parallel = ParallelRenderer(cluster_renderer, max_concurrent=config.parallel_renders)
+            results = asyncio.run(parallel.render_all(cluster_ids, force=force))
+            errors = {cid: r for cid, r in results.items() if isinstance(r, Exception)}
+            rendered = len(results) - len(errors)
+            console.print(f"[green]Rendered {rendered}/{len(results)} cluster(s) (cluster mode).[/green]")
+            if errors:
+                console.print("[yellow]Failures:[/yellow]")
+                for cid, exc in errors.items():
+                    console.print(f"  - {cid}: {type(exc).__name__}: {exc}")
+        else:
+            console.print(f"[red]Unknown --mode {mode!r}. Use 'chunked' or 'cluster'.[/red]")
+            raise typer.Exit(code=2)
+
+        # First finalise attempt.
+        prog.begin("finalise", status="checking readiness")
+        final_path = DocumentFinaliser(project, store, voice_obj).finalise()
+        if final_path is not None:
+            prog.end("finalise", status="document delivered")
+        else:
+            prog.end("finalise", status="refused — running autofix")
+
+        # Convergence loop. Skip entirely if autocorrect=none or already
+        # finalised, or in cluster mode (autofix is chunked-mode only here).
+        if final_path is None and config.autocorrect != "none" and mode == "chunked":
+            from ..auditor.autofix import run_autofix
+            from ..auditor.runner import AuditRunner
+
+            for pass_index in range(2, max_passes + 1):
+                prog.begin_pass(pass_index, max_passes)
+
+                # Audit the current prose.
+                prog.begin("audit", total=len(store.list_clusters()),
+                           status="running per-cluster checks")
+                audit_runner = AuditRunner(config, store, llm=llm, voice=voice_obj)
+                flags = asyncio.run(audit_runner.run())
+                store = GraphStore.load(project)  # reload after persist
+                prog.end("audit", status=f"{len(flags)} flag(s)")
+
+                # Autofix.
+                result = run_autofix(config, store, voice_obj, llm, progress=prog)
+                for note in result.notes:
+                    console.print(f"  {note}")
+
+                # If aggressive marked clusters dirty, re-render them.
+                if result.accepted_rewrite > 0 and mode == "chunked":
+                    prog.begin("rerender", status="re-rendering dirty clusters")
+                    renderer2 = ChunkedRenderer(
+                        config, store, llm, voice_obj,
+                        min_chunk=chunk_min, max_chunk=chunk_max,
+                    )
+                    asyncio.run(renderer2.render_all(force=False, progress=prog))
+                    prog.end("rerender", status="dirty clusters refreshed")
+
+                # Retry finalise.
+                prog.begin("finalise", status=f"retry after pass {pass_index}")
+                final_path = DocumentFinaliser(project, store, voice_obj).finalise()
+                if final_path is not None:
+                    prog.end("finalise", status=f"delivered after pass {pass_index}")
+                    break
+                prog.end("finalise", status="still refused")
+
+                # Stop early if this pass produced no changes — further
+                # passes would loop without effect.
+                if result.total_changes == 0:
+                    console.print(
+                        f"[yellow]Pass {pass_index} produced no changes; "
+                        f"stopping convergence loop.[/yellow]"
+                    )
+                    break
+
+    if final_path is None:
+        console.print(
+            f"[yellow]Finalise still refused after {max_passes} pass(es). See "
+            f"{project / '.lattice' / 'delivery_blocked.md'}[/yellow]"
+        )
+    else:
+        console.print(f"[green]Final document written to {final_path}[/green]")
+
+
+@app.command()
+def audit(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(..., "--voice", "-v"),
+) -> None:
+    """Run the auditor on the last render.
+
+    Deterministic checks always run. The LLM-bound citation engagement check
+    runs when the Claude CLI is available; otherwise it's skipped silently.
+    """
+    project = _require_project(project)
+    config = Config.load(project)
+    store = GraphStore.load(project)
+    voice_obj = _load_voice(project, voice)
+    llm = None
+    if claude_available():
+        try:
+            llm = ClaudeClient(
+                default_model=config.default_model,
+                parallel=config.parallel_renders,
+            )
+        except Exception:
+            llm = None
+    runner = AuditRunner(config, store, llm=llm, voice=voice_obj)
+    flags = asyncio.run(runner.run())
+    from collections import Counter
+    cats = Counter(f.category.value for f in flags)
+    sevs = Counter(f.severity.value for f in flags)
+    console.print(f"[green]Audit produced {len(flags)} flag(s).[/green]")
+    if flags:
+        table = Table(title="Flags by category")
+        table.add_column("category", style="cyan")
+        table.add_column("count", justify="right")
+        for cat, n in cats.most_common():
+            table.add_row(cat, str(n))
+        console.print(table)
+        console.print(f"Severity: " + ", ".join(f"{k}={v}" for k, v in sevs.items()))
+    console.print(
+        f"Report: {(project / '.lattice' / 'audit' / f'audit.{voice}.md')}"
+    )
+
+
+@app.command()
+def flags(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(..., "--voice", "-v"),
+    accept: str | None = typer.Option(None, "--accept", help="Accept one flag by id (uses default mode)."),
+    reject: str | None = typer.Option(None, "--reject", help="Reject one flag by id."),
+    accept_all_category: str | None = typer.Option(None, "--accept-all-category"),
+    reject_all_minor: bool = typer.Option(False, "--reject-all-minor"),
+) -> None:
+    """List flags and apply decisions (non-interactive)."""
+    project = _require_project(project)
+    store = GraphStore.load(project)
+    all_flags = store.list_audit_flags(voice)
+
+    # Apply decisions first.
+    if accept:
+        flag = next((f for f in all_flags if f.flag_id == accept), None)
+        if not flag:
+            console.print(f"[red]Flag not found: {accept}[/red]")
+            raise typer.Exit(code=3)
+        decision = (
+            "accept_rewrite"
+            if flag.default_mode.value == "rewrite"
+            else "accept_suggest_changes"
+        )
+        store.update_flag_decision(accept, decision)
+        console.print(f"[green]Accepted {accept} as {decision}[/green]")
+        return
+    if reject:
+        store.update_flag_decision(reject, "reject")
+        console.print(f"[green]Rejected {reject}[/green]")
+        return
+    if accept_all_category:
+        n = 0
+        for f in all_flags:
+            if f.category.value == accept_all_category and not f.decision:
+                decision = (
+                    "accept_rewrite"
+                    if f.default_mode.value == "rewrite"
+                    else "accept_suggest_changes"
+                )
+                store.update_flag_decision(f.flag_id, decision)
+                n += 1
+        console.print(f"[green]Accepted {n} flag(s) in category {accept_all_category}.[/green]")
+        return
+    if reject_all_minor:
+        n = 0
+        for f in all_flags:
+            if f.severity.value == "minor" and not f.decision:
+                store.update_flag_decision(f.flag_id, "reject")
+                n += 1
+        console.print(f"[green]Rejected {n} minor flag(s).[/green]")
+        return
+
+    # Otherwise: list pending flags.
+    pending = [f for f in all_flags if not f.decision]
+    if not pending:
+        console.print("[green]No pending flags.[/green]")
+        return
+    table = Table(title=f"Pending flags: {len(pending)}")
+    table.add_column("flag_id", style="cyan")
+    table.add_column("category")
+    table.add_column("severity")
+    table.add_column("rule")
+    table.add_column("cluster")
+    table.add_column("offending")
+    for f in pending[:60]:
+        table.add_row(
+            f.flag_id,
+            f.category.value,
+            f.severity.value,
+            f.rule_id,
+            f.cluster_id,
+            f.offending_text[:40],
+        )
+    console.print(table)
+    if len(pending) > 60:
+        console.print(f"... and {len(pending) - 60} more")
+
+
+@app.command()
+def propose(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(..., "--voice", "-v"),
+) -> None:
+    """Run the edit proposer for all accept_suggest_changes flags. Requires API key."""
+    project = _require_project(project)
+    config = Config.load(project)
+    _require_claude()
+    store = GraphStore.load(project)
+    voice_obj = _load_voice(project, voice)
+    llm = ClaudeClient(
+        api_key=config.api_key,
+        default_model=config.default_model,
+        parallel=config.parallel_renders,
+    )
+    proposer = EditProposer(config, store, llm, voice_obj)
+    grouped = asyncio.run(proposer.propose_for_accepted_flags())
+    total = sum(len(v) for v in grouped.values())
+    console.print(f"[green]Proposed {total} edit(s) across {len(grouped)} cluster(s).[/green]")
+
+
+@app.command()
+def edits(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(..., "--voice", "-v"),
+    accept: str | None = typer.Option(None, "--accept"),
+    reject: str | None = typer.Option(None, "--reject"),
+) -> None:
+    """List edit proposals and apply accept/reject (non-interactive)."""
+    project = _require_project(project)
+    store = GraphStore.load(project)
+
+    if accept:
+        store.update_proposal_decision(accept, "accepted")
+        console.print(f"[green]Accepted {accept}[/green]")
+        return
+    if reject:
+        store.update_proposal_decision(reject, "rejected")
+        console.print(f"[green]Rejected {reject}[/green]")
+        return
+
+    proposals = store.list_edit_proposals()
+    pending = [p for p in proposals if p.status.value == "pending"]
+    if not pending:
+        console.print("[green]No pending edit proposals.[/green]")
+        return
+    table = Table(title=f"Pending edit proposals: {len(pending)}")
+    table.add_column("proposal_id", style="cyan")
+    table.add_column("cluster")
+    table.add_column("type")
+    table.add_column("rule")
+    table.add_column("original")
+    table.add_column("proposed")
+    for p in pending[:40]:
+        table.add_row(
+            p.proposal_id,
+            p.cluster_id,
+            p.type.value,
+            p.rule_id,
+            p.original_text[:40],
+            p.proposed_text[:40],
+        )
+    console.print(table)
+
+
+@app.command()
+def apply(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(..., "--voice", "-v"),
+) -> None:
+    """Apply every accepted edit proposal to its prose file."""
+    project = _require_project(project)
+    store = GraphStore.load(project)
+    applier = EditApplier(project, store, voice_name=voice)
+    applied, skipped = applier.apply_all_accepted()
+    console.print(
+        f"[green]Applied {applied} edit(s), skipped {skipped} (original text no longer matches).[/green]"
+    )
+
+
+@app.command()
+def serve(
+    projects_root: Path = typer.Option(
+        Path.home() / "lattice", "--projects-root",
+        help="Root directory containing lattice projects (one folder per project).",
+    ),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(5173, "--port"),
+    reload: bool = typer.Option(False, "--reload"),
+) -> None:
+    """Start the web UI: FastAPI + WebSocket progress streaming + static frontend.
+
+    Visit http://localhost:5173/ in a browser. The UI lists every project
+    under --projects-root, lets you pick a review level (quick / standard /
+    deep), and streams live timeline events as the pipeline executes.
+    """
+    import os
+    os.environ["LATTICE_PROJECTS_ROOT"] = str(projects_root.resolve())
+
+    try:
+        import uvicorn  # type: ignore
+    except ImportError:
+        console.print(
+            "[red]uvicorn is not installed. Install with:[/red]\n"
+            "  pip install fastapi 'uvicorn[standard]' websockets"
+        )
+        raise typer.Exit(code=2)
+
+    console.print(
+        f"[green]Lattice web UI:[/green] http://{host}:{port}/  "
+        f"(projects root: {projects_root.resolve()})"
+    )
+    uvicorn.run(
+        "lattice.web.app:create_app",
+        factory=True,
+        host=host,
+        port=port,
+        reload=reload,
+        log_level="info",
+    )
+
+
+@app.command()
+def autofix(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(..., "--voice", "-v"),
+    level: str | None = typer.Option(
+        None, "--level",
+        help="Override config.autocorrect for this run: none|safe|aggressive.",
+    ),
+) -> None:
+    """Auto-resolve audit flags by chaining flag acceptance + edit proposing + applying.
+
+    The behaviour depends on Config.autocorrect (or --level override):
+
+    - none:       refuses to run; exits with a clear message.
+    - safe:       accepts flags whose default_mode is suggest_changes
+                  (mechanical prose nits — weasel words, citation
+                  engagement, formality), proposes edits for them,
+                  auto-accepts the proposals, applies them.
+    - aggressive: runs the safe pass, additionally accepts rewrite-mode
+                  flags (clusters marked dirty for re-render), and
+                  deletes orphan sentences when no claim attachment
+                  exists.
+
+    Never mutates the author graph.
+    """
+    project = _require_project(project)
+    config = Config.load(project)
+    if level:
+        valid = ("none", "safe", "aggressive")
+        if level not in valid:
+            console.print(f"[red]Invalid --level {level!r}. Must be one of: {', '.join(valid)}[/red]")
+            raise typer.Exit(code=2)
+        config.autocorrect = level
+
+    store = GraphStore.load(project)
+    voice_obj = _load_voice(project, voice)
+
+    llm: ClaudeClient | None = None
+    if claude_available():
+        try:
+            llm = ClaudeClient(
+                default_model=config.default_model,
+                parallel=config.parallel_renders,
+            )
+        except Exception:
+            llm = None
+
+    from ..auditor.autofix import run_autofix
+    result = run_autofix(config, store, voice_obj, llm)
+
+    if result.notes:
+        for note in result.notes:
+            console.print(f"[yellow]{note}[/yellow]")
+
+    if result.total_changes == 0 and not result.notes:
+        console.print("[green]Nothing to autofix.[/green]")
+    else:
+        console.print(
+            f"[green]Autofix at level {config.autocorrect!r}:[/green] "
+            f"{result.summary_line()}"
+        )
+    if result.accepted_rewrite:
+        console.print(
+            "[yellow]Rewrite-mode flags accepted; affected clusters are now "
+            "dirty. Run `lattice render --force` to regenerate them.[/yellow]"
+        )
+
+
+@app.command(name="voice-review")
+def voice_review(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(..., "--voice", "-v"),
+) -> None:
+    """Review the rendered paper against the full academic voice document.
+
+    Document-level layers: register (sentence length distribution, first-person
+    frequency, hedge density, contractions), paragraph (opener variety, length
+    distribution), citation (reporting verb variety, synthesis threshold,
+    positioning frames), architecture (hourglass shape, skim-target presence),
+    attribution (quote thresholds, page specificity), skim targets (gap
+    statement, conclusion strength).
+
+    Writes outputs/voice_review.<voice>.md.
+    """
+    project = _require_project(project)
+    Config.load(project)
+    store = GraphStore.load(project)
+    voice_obj = _load_voice(project, voice)
+    report, out_path = voice_review_document(project, store, voice_obj)
+    if out_path is None:
+        console.print(
+            f"[yellow]No rendered paper found at outputs/paper.{voice}.md. "
+            f"Run `lattice run` first.[/yellow]"
+        )
+        raise typer.Exit(code=3)
+
+    emoji = {"pass": "[green][OK][/green]", "warning": "[yellow][!][/yellow]", "fail": "[red][FAIL][/red]"}
+    console.print(
+        f"{emoji[report.overall]} Voice review: {report.overall} "
+        f"({report.pass_count} pass, {report.warning_count} warning, "
+        f"{report.fail_count} fail)"
+    )
+    table = Table(title="Findings by layer")
+    table.add_column("layer", style="cyan")
+    table.add_column("rule")
+    table.add_column("verdict")
+    table.add_column("summary")
+    for f in report.findings:
+        table.add_row(f.layer, f.rule, f.compliance, f.summary[:80])
+    console.print(table)
+    console.print(f"[green]Report written to {out_path}[/green]")
+
+
+@app.command(name="source-review")
+def source_review(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(..., "--voice", "-v"),
+    reference: Path = typer.Option(
+        ..., "--reference", "-r",
+        help="Path to a richer reference document (e.g. the human-written long form) "
+             "to compare the rendered paper against.",
+    ),
+) -> None:
+    """Compare the rendered paper to a richer reference document.
+
+    Surfaces specific content gaps: quantitative facts, named scholars,
+    mechanisms, analytical pivots, arithmetic walkthroughs, and concrete
+    examples that the reference carries but the rendered paper omits.
+
+    The output is advisory. The author reviews the gap report and decides
+    what (if anything) to add to the graph; nothing is auto-injected.
+
+    Writes outputs/source_gap_review.<voice>.md.
+    """
+    project = _require_project(project)
+    config = Config.load(project)
+    voice_obj = _load_voice(project, voice)
+    paper_path = project / "outputs" / f"paper.{voice_obj.name}.md"
+    if not paper_path.exists():
+        console.print(
+            f"[red]No rendered paper at {paper_path}. Run `lattice render` first.[/red]"
+        )
+        raise typer.Exit(code=3)
+    if not reference.exists():
+        console.print(f"[red]Reference document not found: {reference}[/red]")
+        raise typer.Exit(code=3)
+
+    _require_claude()
+    llm = ClaudeClient(
+        default_model=config.default_model,
+        parallel=config.parallel_renders,
+    )
+
+    store = GraphStore.load(project)
+    graph = store.get_graph()
+
+    from ..auditor.source_gap_review import SourceGapReview, write_report
+    review = SourceGapReview(config, llm)
+    report = asyncio.run(review.review(
+        paper_path=paper_path,
+        reference_path=reference,
+        graph=graph,
+    ))
+    out_path = write_report(report, project, voice_obj.name)
+
+    by_cat = report.by_category
+    console.print(f"[green]Source-gap review: {len(report.gaps)} gap(s) identified.[/green]")
+    if by_cat:
+        table = Table(title="Gaps by category")
+        table.add_column("category", style="cyan")
+        table.add_column("count", justify="right")
+        for cat in sorted(by_cat, key=lambda k: -len(by_cat[k])):
+            table.add_row(cat, str(len(by_cat[cat])))
+        console.print(table)
+    console.print(f"[green]Report written to {out_path}[/green]")
+
+
+@app.command(name="source-review-apply")
+def source_review_apply(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(..., "--voice", "-v"),
+    interactive: bool = typer.Option(
+        True, "--interactive/--batch",
+        help="Walk gaps interactively. Use --batch with --accept-all-with-targets "
+             "to apply every gap that has a target_claim_id without prompting.",
+    ),
+    accept_all_with_targets: bool = typer.Option(
+        False, "--accept-all-with-targets",
+        help="In batch mode, mark every gap with a non-empty target_claim_id as "
+             "accepted before applying. Useful for triaging large reports.",
+    ),
+    only_categories: str = typer.Option(
+        "", "--only",
+        help="Comma-separated list of categories to walk (e.g. 'mechanism,quantitative'). "
+             "Gaps in other categories are left untouched.",
+    ),
+) -> None:
+    """Walk the structured source-gap report and apply accepted gaps.
+
+    Reads .lattice/source_gap_review.<voice>.json (produced by
+    ``lattice source-review``). For each undecided gap, prompts the
+    author for accept / reject / defer, then injects accepted gaps into
+    the graph:
+
+    - mechanism      → sets Claim.mechanism on target_claim_id
+    - quantitative   → appends quote to Evidence on target_claim_id
+    - arithmetic
+    - named_scholar
+    - named_example
+    - analytical_move / structural → logged for manual handling
+
+    Decisions persist to the JSON report so re-runs skip already-decided
+    gaps. The graph is saved after the pass; nothing is silently
+    revised.
+    """
+    project = _require_project(project)
+    voice_obj = _load_voice(project, voice)
+
+    from ..auditor.source_gap_apply import (
+        apply_report,
+        log_decisions,
+        save_decisions,
+    )
+    from ..auditor.source_gap_review import load_report
+
+    report = load_report(project, voice_obj.name)
+    if report is None:
+        console.print(
+            f"[red]No source-gap report found for voice {voice_obj.name!r}. "
+            f"Run `lattice source-review` first.[/red]"
+        )
+        raise typer.Exit(code=3)
+
+    store = GraphStore.load(project)
+    claim_lookup = {c.claim_id: c.statement for c in store.get_graph().claims}
+
+    category_filter: set[str] | None = None
+    if only_categories:
+        category_filter = {c.strip() for c in only_categories.split(",") if c.strip()}
+
+    pending = [
+        g for g in report.gaps
+        if g.decision is None
+        and (category_filter is None or g.category in category_filter)
+    ]
+    if not pending:
+        console.print(f"[yellow]No undecided gaps to apply.[/yellow]")
+        raise typer.Exit(code=0)
+
+    console.print(
+        f"[cyan]Walking {len(pending)} undecided gap(s) "
+        f"(of {len(report.gaps)} total).[/cyan]"
+    )
+    console.print()
+
+    if not interactive and accept_all_with_targets:
+        # Batch path: accept everything that has a target.
+        for gap in pending:
+            if gap.target_claim_id and gap.target_claim_id in claim_lookup:
+                gap.decision = "accepted"
+            else:
+                gap.decision = "deferred"
+        accepted = sum(1 for g in pending if g.decision == "accepted")
+        console.print(
+            f"[cyan]Batch: accepted {accepted}, deferred {len(pending) - accepted}.[/cyan]"
+        )
+    elif not interactive:
+        console.print(
+            "[red]--batch requires --accept-all-with-targets in this version.[/red]"
+        )
+        raise typer.Exit(code=2)
+    else:
+        for i, gap in enumerate(pending, start=1):
+            target_summary = (
+                claim_lookup.get(gap.target_claim_id, "(target not in graph)")[:120]
+                if gap.target_claim_id
+                else "(no target)"
+            )
+            console.print(f"[bold cyan]Gap {i}/{len(pending)}[/bold cyan] "
+                          f"[{gap.category}]")
+            console.print(f"  summary: {gap.summary}")
+            console.print(f"  reference: [italic]{gap.reference_snippet[:300]}[/italic]")
+            console.print(f"  suggested action: {gap.suggested_action or '(none)'}")
+            console.print(f"  target: [yellow]{gap.target_claim_id or '(none)'}[/yellow] "
+                          f"— {target_summary}")
+            choice = typer.prompt(
+                "  [a]ccept / [r]eject / [d]efer / [s]kip remaining",
+                default="d",
+            ).strip().lower()
+            if choice in ("a", "accept"):
+                gap.decision = "accepted"
+            elif choice in ("r", "reject"):
+                gap.decision = "rejected"
+            elif choice in ("s", "skip"):
+                console.print("[yellow]Skipping remainder.[/yellow]")
+                break
+            else:
+                gap.decision = "deferred"
+            console.print()
+
+    # Apply accepted gaps to the graph.
+    results = apply_report(report, store)
+    log_decisions(report, project, voice_obj.name, results)
+    save_decisions(report, project, voice_obj.name)
+
+    # Summary.
+    from collections import Counter
+    counts = Counter(r.action for r in results)
+    table = Table(title="Apply pass results")
+    table.add_column("action", style="cyan")
+    table.add_column("count", justify="right")
+    for action, n in counts.most_common():
+        table.add_row(action, str(n))
+    console.print(table)
+    console.print(
+        f"[green]Decisions logged. Re-run `lattice render --force` to use the "
+        f"updated graph.[/green]"
+    )
+
+
+@app.command()
+def consistency(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(..., "--voice", "-v"),
+    threshold: float = typer.Option(0.35, "--threshold"),
+) -> None:
+    """Re-render edited clusters and flag any that have drifted from voice. Requires API key."""
+    project = _require_project(project)
+    config = Config.load(project)
+    _require_claude()
+    store = GraphStore.load(project)
+    voice_obj = _load_voice(project, voice)
+    llm = ClaudeClient(
+        api_key=config.api_key,
+        default_model=config.default_model,
+        parallel=config.parallel_renders,
+    )
+    check = VoiceConsistencyCheck(config, store, llm, voice_obj, drift_threshold=threshold)
+    drifted = asyncio.run(check.check_all_edited())
+    if not drifted:
+        console.print("[green]All edited clusters within voice similarity threshold.[/green]")
+        return
+    table = Table(title=f"Drifted clusters (threshold={threshold})")
+    table.add_column("cluster_id", style="cyan")
+    table.add_column("similarity", justify="right")
+    for cluster, sim in drifted:
+        table.add_row(cluster.cluster_id, f"{sim:.3f}")
+    console.print(table)
+
+
+@app.command()
+def run(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(..., "--voice", "-v"),
+    with_shadow: bool = typer.Option(False, "--with-shadow", help="Include shadow mapping stage."),
+    resume: bool = typer.Option(False, "--resume", help="Continue the latest run from its last completed stage."),
+    max_passes: int = typer.Option(3, "--max-passes", help="Max auto-fix passes after audit."),
+    min_delta: int = typer.Option(5, "--min-delta", help="Stop auto-fix loop if flag drop < this between passes."),
+    review: bool = typer.Option(False, "--review", help="Pause after annotation so you can inspect structure/outline.annotated.md."),
+) -> None:
+    """Hands-free pipeline: annotate -> ingest -> index -> enrich -> plan ->
+    render -> audit -> auto-fix loop -> DOCX with unresolved flags as comments.
+
+    By default runs without pausing. Use `--review` to pause after annotation.
+    `--with-shadow` adds shadow+differ between enrich and plan.
+    """
+    project = _require_project(project)
+    runner = PipelineRunner(
+        project, voice,
+        with_shadow=with_shadow,
+        review=review,
+        max_passes=max_passes,
+        min_delta=min_delta,
+        console=console,
+    )
+    state = asyncio.run(runner.run_full(resume=resume))
+    completed = sum(1 for v in state.stage_status.values() if v == StageStatus.completed)
+    console.print(f"[green]Run {state.run_id}: {completed} stage(s) completed.[/green]")
+
+
+@app.command()
+def annotate(
+    project: Path = typer.Argument(...),
+) -> None:
+    """Annotate the raw scaffold and write structure/outline.annotated.md.
+
+    Runs the contextual annotator (thesis extraction, section roles, claim
+    roles, inline citation mapping). The annotated file is plain markdown
+    so you can open it, review what the LLM inferred, and edit anything
+    you disagree with before running the rest of the pipeline.
+    """
+    project = _require_project(project)
+    config = Config.load(project)
+    store = GraphStore.load(project)
+
+    structure_dir = project / "structure"
+    raw_candidates = sorted(
+        [
+            p for p in structure_dir.glob("*")
+            if p.is_file()
+            and p.suffix.lower() in (".docx", ".md")
+            and p.name != "outline.annotated.md"
+            and not p.name.startswith("~$")
+            and not p.name.endswith(".original.docx")
+        ],
+        key=lambda p: p.name,
+    )
+    if not raw_candidates:
+        console.print(f"[red]No raw outline in {structure_dir}[/red]")
+        raise typer.Exit(code=3)
+    raw = raw_candidates[0]
+
+    llm = None
+    if claude_available():
+        try:
+            llm = ClaudeClient(default_model=config.default_model, parallel=config.parallel_renders)
+        except Exception:
+            llm = None
+    if llm is None:
+        console.print("[yellow]Claude CLI not available. Running annotator in deterministic-only mode (citation regex only).[/yellow]")
+
+    if raw.suffix.lower() == ".docx":
+        ingester: object = DOCXOutlineIngester(config)
+    else:
+        ingester = MarkdownOutlineIngester(config)
+    graph = asyncio.run(ingester.ingest(raw, project_name=project.name))
+
+    from ..graph.serialize_outline import write_annotated_outline
+    known_sources = {s.source_id for s in store.list_sources()}
+    annotator = ContextualAnnotator(config, llm)
+    graph = asyncio.run(annotator.annotate(graph, known_source_ids=known_sources))
+    out_path = write_annotated_outline(graph, project)
+    # Persist the annotated graph (with inferred relationships) so downstream
+    # commands like `lattice graph` see the structure without a re-ingest.
+    store.save_graph(graph)
+
+    refs = sum(1 for s in graph.sections if s.role.value == "references")
+    roles = sum(1 for c in graph.claims if any(t.startswith("role:") for t in c.tags))
+    user_synth = sum(1 for c in graph.claims if c.type.value == "user_synthesis")
+    rels = len(graph.relationships)
+    console.print(
+        f"[green]Annotated {raw.name} -> {out_path.name}: "
+        f"{len(graph.sections)} sections ({refs} references), "
+        f"{len(graph.claims)} claims ({roles} with roles, {user_synth} user_synthesis), "
+        f"{rels} relationships inferred.[/green]"
+    )
+    console.print(f"Review and edit {out_path} before running `lattice run`.")
+
+
+@app.command(name="run-clean")
+def run_clean(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(..., "--voice", "-v"),
+) -> None:
+    """Discard .lattice/cache/ and rerun the full pipeline from scratch."""
+    project = _require_project(project)
+    cache_dir = project / ".lattice" / "cache"
+    if cache_dir.exists():
+        import shutil
+        shutil.rmtree(cache_dir)
+        console.print(f"[yellow]Cleared {cache_dir}.[/yellow]")
+    runner = PipelineRunner(project, voice, with_shadow=False, console=console)
+    state = asyncio.run(runner.run_full(resume=False))
+    console.print(f"[green]Clean run {state.run_id} finished.[/green]")
+
+
+# ─── Voice sub-commands ──────────────────────────────────
+
+voices_app = typer.Typer(name="voices", help="Voice file management.")
+app.add_typer(voices_app, name="voices")
+
+
+@voices_app.command("list")
+def voices_list(project: Path = typer.Argument(...)) -> None:
+    """Show available voices in voices/."""
+    project = _require_project(project)
+    voices_dir = project / "voices"
+    if not voices_dir.exists():
+        console.print(f"[red]No voices/ directory in {project}[/red]")
+        raise typer.Exit(code=3)
+    files = sorted(voices_dir.glob("*.voice.md"))
+    if not files:
+        console.print("[yellow]No voice files found.[/yellow]")
+        return
+    table = Table(title="Voices")
+    table.add_column("name", style="cyan")
+    table.add_column("architecture")
+    table.add_column("description")
+    for path in files:
+        try:
+            v = Voice.from_file(path)
+            table.add_row(v.name, v.architecture.template, v.description[:80])
+        except Exception as exc:
+            table.add_row(path.stem, "(parse error)", str(exc)[:80])
+    console.print(table)
+
+
+@voices_app.command("new")
+def voices_new(project: Path = typer.Argument(...), name: str = typer.Argument(...)) -> None:
+    """Scaffold a new voice file from the academic template."""
+    project = _require_project(project)
+    dest = project / "voices" / f"{name}.voice.md"
+    if dest.exists():
+        console.print(f"[red]{dest} already exists.[/red]")
+        raise typer.Exit(code=3)
+
+    # Copy the academic voice as a starting point.
+    src_path = project / "voices" / "academic.voice.md"
+    if src_path.exists():
+        dest.write_text(
+            src_path.read_text(encoding="utf-8").replace(
+                "name: academic", f"name: {name}", 1
+            ),
+            encoding="utf-8",
+        )
+    else:
+        dest.write_text(
+            f"---\nname: {name}\ndescription: TODO\n---\n", encoding="utf-8"
+        )
+    console.print(f"[green]Created {dest}[/green]")
+
+
+@voices_app.command("validate")
+def voices_validate(file: Path = typer.Argument(...)) -> None:
+    """Check a voice file for errors."""
+    if not file.exists():
+        console.print(f"[red]Not found: {file}[/red]")
+        raise typer.Exit(code=3)
+    try:
+        voice = Voice.from_file(file)
+    except Exception as exc:
+        console.print(f"[red]Parse error: {exc}[/red]")
+        raise typer.Exit(code=3)
+    issues = voice.validate_self()
+    if not issues:
+        console.print(f"[green]{file}: valid.[/green]")
+        return
+    console.print(f"[yellow]{file}: {len(issues)} issue(s):[/yellow]")
+    for issue in issues:
+        console.print(f"  - {issue}")
+    raise typer.Exit(code=3)
+
+
+# ─── Misc ────────────────────────────────────────────────
+
+
+@app.command()
+def diff(
+    project: Path = typer.Argument(...),
+    before: str = typer.Argument(...),
+    after: str = typer.Argument(...),
+) -> None:
+    """Show graph changes between two versions."""
+    raise NotImplementedError
+
+
+@app.command()
+def resume(project: Path = typer.Argument(...)) -> None:
+    """Resume the latest run from its last completed stage (uses last run's voice)."""
+    project = _require_project(project)
+    manager = ResumeManager(project)
+    latest = manager.latest_run()
+    if latest is None:
+        console.print("[red]No prior run to resume.[/red]")
+        raise typer.Exit(code=3)
+    if not latest.voice:
+        console.print("[red]Latest run has no voice recorded; invoke `lattice run` manually.[/red]")
+        raise typer.Exit(code=3)
+    runner = PipelineRunner(project, latest.voice, console=console)
+    state = asyncio.run(runner.run_full(resume=True))
+    completed = sum(1 for v in state.stage_status.values() if v == StageStatus.completed)
+    console.print(f"[green]Resumed run {state.run_id}: {completed} stage(s) completed.[/green]")
+
+
+@app.command()
+def graph(
+    project: Path = typer.Argument(...),
+    show: bool = typer.Option(True, "--show/--no-show", help="Print Rich tree to terminal."),
+    mermaid: bool = typer.Option(True, "--mermaid/--no-mermaid", help="Write outputs/argument_graph.mmd."),
+    html_view: bool = typer.Option(True, "--html/--no-html", help="Write outputs/argument_graph.html."),
+) -> None:
+    """Visualise the argument scaffold three ways: terminal tree, Mermaid, HTML."""
+    project = _require_project(project)
+    store = GraphStore.load(project)
+    g = store.get_graph()
+    clusters = store.list_clusters()
+    if show:
+        render_tree(g, clusters=clusters, console=console)
+    paths_written: list[Path] = []
+    if mermaid:
+        paths_written.append(write_mermaid(g, project))
+    if html_view:
+        paths_written.append(write_html(g, project))
+    for p in paths_written:
+        console.print(f"[green]wrote {p}[/green]")
+
+
+@app.command()
+def export(
+    project: Path = typer.Argument(...),
+    to: str = typer.Option(..., "--to", help="Export format (currently: argus)."),
+) -> None:
+    """Export the working graph to an external format."""
+    project = _require_project(project)
+    if to != "argus":
+        console.print(f"[red]Unknown export format: {to}[/red]")
+        raise typer.Exit(code=3)
+    store = GraphStore.load(project)
+    graph = store.get_graph()
+    out_path = project / "outputs" / f"{project.name}.argus.json"
+    export_to_argus(graph, out_path)
+    console.print(f"[green]Exported to {out_path}[/green]")
+
+
+if __name__ == "__main__":
+    app()
