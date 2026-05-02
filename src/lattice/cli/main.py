@@ -1311,6 +1311,572 @@ def _prompt_via_editor(cand) -> str:
     return " ".join(body_lines).strip()
 
 
+citations_app = typer.Typer(
+    help="Citation management — scan, match, verify, fill, restyle.",
+    no_args_is_help=True,
+)
+app.add_typer(citations_app, name="citations")
+
+
+@citations_app.command("scan")
+def citations_scan(
+    project: Path = typer.Argument(...),
+    document: Path = typer.Option(
+        None, "--document", "-d",
+        help="Document to scan (default: outputs/paper.<voice>.md or "
+             "structure/outline.md, whichever exists).",
+    ),
+    voice: str = typer.Option(
+        "academic", "--voice", "-v",
+        help="Voice name (used to find the rendered paper).",
+    ),
+    no_match: bool = typer.Option(
+        False, "--no-match",
+        help="Skip the matcher pass that links inline citations to "
+             "Sources. Default is to scan + match in one go.",
+    ),
+) -> None:
+    """Scan a document for inline citations, footnotes, and the
+    bibliography section. Detects the citation system in use and
+    writes ``.lattice/document_citations.json``.
+
+    By default, also runs the matcher (links each inline / footnote
+    citation to a known Source by surname + year, resolves
+    Ibid. / op. cit.). Pass ``--no-match`` to skip.
+
+    Pure regex/heuristics — no LLM calls. Run on the full rendered
+    paper (``outputs/paper.<voice>.md``) for best coverage; falls back
+    to the outline if no paper exists.
+    """
+    project = _require_project(project)
+    Config.load(project)
+
+    if document is None:
+        candidates = [
+            project / "outputs" / f"paper.{voice}.md",
+            project / "structure" / "outline.md",
+        ]
+        for c in candidates:
+            if c.exists():
+                document = c
+                break
+    if document is None or not document.exists():
+        console.print(f"[red]No document found to scan.[/red]")
+        raise typer.Exit(code=3)
+
+    from ..references.matcher import match_citations
+    from ..references.scanner import save_document_citations, scan_document
+
+    text = document.read_text(encoding="utf-8")
+    doc = scan_document(
+        text, project_name=project.name, document_path=str(document),
+    )
+
+    if not no_match:
+        store = GraphStore.load(project)
+        sources = store.list_sources()
+        match_citations(doc, sources)
+
+    path = save_document_citations(project, doc)
+
+    detail = (
+        f"{doc.counts['inline_total']} inline, "
+        f"{doc.counts['footnotes_total']} footnote(s), "
+        f"{doc.counts['bibliography_entries']} bibliography entries"
+    )
+    if not no_match:
+        m = doc.counts.get("inline_matched", 0)
+        u = doc.counts.get("inline_unmatched", 0)
+        detail += f" · {m} matched, {u} unresolved"
+    console.print(
+        f"[cyan]Scanned[/cyan] {document}: "
+        f"{doc.detected_system.value} system · {detail}."
+    )
+    console.print(f"  json → {path}")
+
+
+@citations_app.command("verify")
+def citations_verify(
+    project: Path = typer.Argument(...),
+    no_cache: bool = typer.Option(
+        False, "--no-cache",
+        help="Ignore the verification cache and re-query everything.",
+    ),
+    crossref_only: bool = typer.Option(
+        False, "--crossref-only",
+        help="Skip the OpenAlex pass.",
+    ),
+    openalex_only: bool = typer.Option(
+        False, "--openalex-only",
+        help="Skip the Crossref pass.",
+    ),
+    user_email: str = typer.Option(
+        "", "--email",
+        help="Optional contact email; included in the polite-pool "
+             "User-Agent so Crossref can reach you about traffic.",
+    ),
+) -> None:
+    """Verify each source against Crossref + OpenAlex.
+
+    For every source in the project's source store: lookup by DOI when
+    present, else search by title + author + year. Score the canonical
+    metadata against the paper's; surface field-level discrepancies.
+
+    Cached by source-content hash; re-runs are cheap. Updates
+    .lattice/document_citations.json (per-source verifications) AND
+    .lattice/citation_verifications.json (the cache).
+    """
+    import asyncio as _asyncio
+
+    project = _require_project(project)
+    Config.load(project)
+    store = GraphStore.load(project)
+    sources = store.list_sources()
+    if not sources:
+        console.print(
+            "[yellow]No sources to verify. Run `lattice index` (and "
+            "optionally `lattice citations scan`) first.[/yellow]"
+        )
+        raise typer.Exit(code=3)
+
+    from ..references.scanner import (
+        load_document_citations,
+        save_document_citations,
+    )
+    from ..references.verifier import (
+        VerifierConfig,
+        load_verification_cache,
+        save_verification_cache,
+        verify_sources,
+    )
+
+    cache = {} if no_cache else load_verification_cache(project)
+    cfg = VerifierConfig(
+        user_agent=(
+            f"lattice-citation-verifier/0.1 (mailto:{user_email})"
+            if user_email else f"lattice-citation-verifier/0.1"
+        ),
+        use_crossref=not openalex_only,
+        use_openalex=not crossref_only,
+    )
+
+    console.print(
+        f"[cyan]Verifying[/cyan] {len(sources)} source(s) "
+        f"({len(cache)} cached)..."
+    )
+    results = _asyncio.run(verify_sources(sources, config=cfg, cache=cache))
+    save_verification_cache(project, results)
+
+    # Update document_citations.json so the filler + restyle steps see
+    # the verifications.
+    doc = load_document_citations(project)
+    if doc is not None:
+        doc.verifications = results
+        save_document_citations(project, doc)
+
+    matched = sum(1 for v in results.values() if v.matched)
+    error_diffs = sum(
+        1 for v in results.values()
+        for d in v.discrepancies
+        if d.severity.value == "error"
+    )
+    warn_diffs = sum(
+        1 for v in results.values()
+        for d in v.discrepancies
+        if d.severity.value == "warning"
+    )
+    console.print(
+        f"[green]Verified[/green] {matched}/{len(sources)} matched · "
+        f"{error_diffs} error-level discrepancy(ies) · "
+        f"{warn_diffs} warning(s)."
+    )
+
+
+@citations_app.command("fill")
+def citations_fill(
+    project: Path = typer.Argument(...),
+    severity: str = typer.Option(
+        "info", "--severity",
+        help="Minimum severity to walk: error / warning / info "
+             "(default: info — walks everything).",
+    ),
+    limit: int = typer.Option(
+        0, "--limit",
+        help="Stop after this many decisions (0 = no limit).",
+    ),
+    accept_all_gaps: bool = typer.Option(
+        False, "--accept-all-gaps",
+        help="Auto-accept canonical values for fields where the paper "
+             "currently has nothing (info-level gap fills). Useful for "
+             "DOI / pages / volume / issue when the verifier returned a "
+             "high-confidence match.",
+    ),
+) -> None:
+    """Walk the verifier's discrepancies and accept / reject each.
+
+    For every field where the paper disagrees with Crossref / OpenAlex,
+    show paper value vs canonical value and prompt:
+
+      a) accept canonical · r) keep paper · m) manual override
+      enter) skip · q) quit
+
+    Decisions are logged to ``.lattice/citation_decisions.json``;
+    re-runs only walk undecided fields. Source records in the source
+    store are updated in place.
+    """
+    from ..references.filler import (
+        apply_decisions,
+        append_decisions,
+        collect_fill_candidates,
+        FillDecision,
+        load_decisions,
+    )
+    from ..graph.models import CitationDiscrepancySeverity
+
+    project = _require_project(project)
+    Config.load(project)
+    store = GraphStore.load(project)
+    sources = store.list_sources()
+    if not sources:
+        console.print("[yellow]No sources to fill.[/yellow]")
+        raise typer.Exit(code=3)
+
+    from ..references.verifier import load_verification_cache
+    verifications = load_verification_cache(project)
+    if not verifications:
+        console.print(
+            "[yellow]No verification cache. Run "
+            "`lattice citations verify` first.[/yellow]"
+        )
+        raise typer.Exit(code=3)
+
+    severity_floor = {
+        "error": CitationDiscrepancySeverity.error,
+        "warning": CitationDiscrepancySeverity.warning,
+        "info": CitationDiscrepancySeverity.info,
+    }.get(severity.lower(), CitationDiscrepancySeverity.info)
+
+    decided = load_decisions(project)
+    candidates = collect_fill_candidates(
+        verifications, decided=decided, severity_floor=severity_floor,
+    )
+    if not candidates:
+        console.print(
+            "[green]Nothing to fill — every discrepancy already "
+            "decided or below severity floor.[/green]"
+        )
+        return
+    if limit > 0:
+        candidates = candidates[:limit]
+
+    console.print(
+        f"[cyan]{len(candidates)} field(s) to decide.[/cyan]  "
+        f"[bold]a[/bold]ccept · [bold]r[/bold]eject · [bold]m[/bold]anual · "
+        f"[bold]Enter[/bold] skip · [bold]q[/bold]uit"
+    )
+    console.print()
+
+    decisions: list[FillDecision] = []
+    for i, cand in enumerate(candidates, 1):
+        sev_colour = {
+            CitationDiscrepancySeverity.error: "red",
+            CitationDiscrepancySeverity.warning: "yellow",
+            CitationDiscrepancySeverity.info: "dim",
+        }[cand.severity]
+        gap = " [dim](gap fill)[/dim]" if cand.is_gap_fill else ""
+        console.print(
+            f"[bold]\\[{i}/{len(candidates)}][/bold] "
+            f"source [cyan]{cand.source_id}[/cyan] · field "
+            f"[bold]{cand.field}[/bold] · "
+            f"[{sev_colour}]{cand.severity.value}[/{sev_colour}] · "
+            f"verifier {cand.verifier.value}{gap}"
+        )
+        console.print(f"  paper:     [yellow]{cand.paper_value or '(empty)'}[/yellow]")
+        console.print(f"  canonical: [green]{cand.canonical_value or '(empty)'}[/green]")
+
+        if accept_all_gaps and cand.is_gap_fill and cand.severity == CitationDiscrepancySeverity.info:
+            decisions.append(FillDecision(
+                candidate=cand, action="accept_canonical",
+            ))
+            console.print("  [dim]auto-accepted (gap-fill mode)[/dim]")
+            console.print()
+            continue
+
+        try:
+            choice = typer.prompt(
+                "  action [a/r/m/Enter/q]", default="", show_default=False,
+            ).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[yellow]aborted by user[/yellow]")
+            break
+        if choice == "q":
+            break
+        if choice == "" or choice == "skip":
+            decisions.append(FillDecision(candidate=cand, action="skip"))
+        elif choice == "a":
+            decisions.append(FillDecision(
+                candidate=cand, action="accept_canonical",
+            ))
+        elif choice == "r":
+            decisions.append(FillDecision(candidate=cand, action="reject"))
+        elif choice == "m":
+            try:
+                value = typer.prompt(
+                    "  manual value", default="", show_default=False,
+                ).strip()
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[yellow]aborted[/yellow]")
+                break
+            decisions.append(FillDecision(
+                candidate=cand, action="manual_override", chosen_value=value,
+            ))
+        else:
+            console.print(f"  [yellow]unknown choice {choice!r} — skipped[/yellow]")
+            decisions.append(FillDecision(candidate=cand, action="skip"))
+        console.print()
+
+    updated, log = apply_decisions(sources, decisions)
+    for src in updated.values():
+        # Only save sources that actually changed.
+        original = next((s for s in sources if s.source_id == src.source_id), None)
+        if original is None or original.model_dump_json() != src.model_dump_json():
+            store.save_source(src)
+    if log:
+        append_decisions(project, log)
+
+    applied = sum(1 for d in decisions if d.action != "skip")
+    console.print(
+        f"[green]Recorded {applied} decision(s); "
+        f"updated {sum(1 for s in updated.values() if next((o for o in sources if o.source_id == s.source_id), None) and next(o for o in sources if o.source_id == s.source_id).model_dump_json() != s.model_dump_json())} source(s).[/green]"
+    )
+
+
+@citations_app.command("restyle")
+def citations_restyle(
+    project: Path = typer.Argument(...),
+    document: Path = typer.Option(
+        None, "--document", "-d",
+        help="Source document (default: outputs/paper.<voice>.md).",
+    ),
+    voice: str = typer.Option("academic", "--voice", "-v"),
+    style: str = typer.Option(
+        "apa", "--style", "-s",
+        help="Target citation style: harvard / apa / chicago_author_date / "
+             "mla / vancouver / ieee. To use a per-journal override, "
+             "pass `--journal <name>` instead (or as well — the journal's "
+             "declared base wins).",
+    ),
+    journal: str = typer.Option(
+        "", "--journal", "-j",
+        help="Apply a per-journal style override from "
+             "voices/journals/<journal>.yml. Supersedes --style when set.",
+    ),
+    output: Path = typer.Option(
+        None, "--output", "-o",
+        help="Output path (default: <stem>.<style><suffix> next to source).",
+    ),
+) -> None:
+    """Rewrite a document in a target citation style.
+
+    Walks every inline citation and the bibliography, re-emits in the
+    new style. Deterministic, no LLM calls — instant style switching.
+
+    Run `lattice citations scan` first so DocumentCitations is fresh;
+    `lattice citations verify` + `lattice citations fill` are
+    optional but improve the bibliography quality.
+
+    Pass `--journal nature` (or another name from
+    `lattice citations journals list`) to apply per-journal tweaks
+    on top of the base style.
+    """
+    project = _require_project(project)
+    Config.load(project)
+
+    if document is None:
+        document = project / "outputs" / f"paper.{voice}.md"
+    if not document.exists():
+        console.print(f"[red]Document not found: {document}[/red]")
+        raise typer.Exit(code=3)
+
+    from ..references.matcher import match_citations
+    from ..references.rewriter import restyle_document, write_restyled
+    from ..references.scanner import scan_document
+
+    target_style = style
+    journal_obj = None
+    if journal:
+        from ..references.journal_styles import load_journal_style
+        try:
+            journal_obj = load_journal_style(project, journal)
+        except (FileNotFoundError, ValueError) as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(code=3)
+        target_style = journal_obj.base
+
+    text = document.read_text(encoding="utf-8")
+    doc = scan_document(text, project_name=project.name, document_path=str(document))
+    store = GraphStore.load(project)
+    sources = store.list_sources()
+    match_citations(doc, sources)
+
+    try:
+        result = restyle_document(text, doc, sources, style=target_style)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+
+    if journal_obj is not None:
+        # Apply journal-specific post-processing to the restyled doc.
+        from ..output.citation_formatter import format_citation
+        from ..references.journal_styles import format_for_journal
+        cited_ids = {
+            ic.source_id for ic in doc.inline_citations if ic.source_id
+        } | {
+            (f.source_id or f.resolves_to_source_id) for f in doc.footnotes
+        }
+        for src in sources:
+            if src.source_id not in cited_ids:
+                continue
+            override = format_for_journal(src.citation, journal_obj)
+            base_formatted = format_citation(src.citation, target_style)
+            if (
+                base_formatted.bibliography
+                and base_formatted.bibliography in result.document
+            ):
+                result.document = result.document.replace(
+                    base_formatted.bibliography, override.bibliography, 1,
+                )
+        result.style = f"{target_style}+{journal_obj.name}"
+
+    out_path = write_restyled(document, result, output_path=output)
+    console.print(
+        f"[green]Restyled[/green] {document.name} → {out_path.name} "
+        f"({result.inline_replaced} inline replaced, "
+        f"{result.inline_unresolved} unresolved, "
+        f"{result.bibliography_emitted} bibliography entries)."
+    )
+    if result.notes:
+        for note in result.notes:
+            console.print(f"  [yellow]note[/yellow] {note}")
+
+
+journals_app = typer.Typer(
+    help="Per-journal citation style overrides.",
+    no_args_is_help=True,
+)
+citations_app.add_typer(journals_app, name="journals")
+
+
+@journals_app.command("list")
+def journals_list(project: Path = typer.Argument(...)) -> None:
+    """List available per-journal style overrides."""
+    project = _require_project(project)
+    from ..references.journal_styles import list_journal_styles, load_journal_style
+    names = list_journal_styles(project)
+    if not names:
+        console.print(
+            "[yellow]No journal styles. Run "
+            "`lattice citations journals install` to add the starter "
+            "library (Nature, Science, IEEE Transactions, etc.).[/yellow]"
+        )
+        return
+    table = Table(title=f"Journal styles in {project.name}")
+    table.add_column("name", style="cyan")
+    table.add_column("base")
+    table.add_column("description")
+    for name in names:
+        try:
+            j = load_journal_style(project, name)
+            desc = (j.description or "").split("\n")[0][:60]
+            table.add_row(name, j.base, desc)
+        except Exception as e:  # noqa: BLE001
+            table.add_row(name, "?", f"[red]{e}[/red]")
+    console.print(table)
+
+
+@journals_app.command("install")
+def journals_install(project: Path = typer.Argument(...)) -> None:
+    """Install the starter library of journal styles into
+    ``voices/journals/``. Idempotent — won't overwrite your edits."""
+    project = _require_project(project)
+    from ..references.journal_styles import write_starter_journal_styles
+    written = write_starter_journal_styles(project)
+    if not written:
+        console.print(
+            "[dim]No new files written — every starter style was "
+            "already present.[/dim]"
+        )
+    else:
+        console.print(
+            f"[green]Wrote {len(written)} journal style(s):[/green] "
+            f"{', '.join(p.stem for p in written)}"
+        )
+
+
+@citations_app.command("report")
+def citations_report(
+    project: Path = typer.Argument(...),
+) -> None:
+    """Print a summary of the project's citation state.
+
+    Shows: scan status, system detected, inline / footnote counts,
+    matched vs unresolved, verification status, error-level
+    discrepancies, undecided fill candidates.
+    """
+    project = _require_project(project)
+
+    from ..references.scanner import load_document_citations
+    from ..references.verifier import load_verification_cache
+    from ..references.filler import collect_fill_candidates, load_decisions
+
+    doc = load_document_citations(project)
+    if doc is None:
+        console.print(
+            "[yellow]No DocumentCitations found. Run "
+            "`lattice citations scan` first.[/yellow]"
+        )
+        raise typer.Exit(code=3)
+
+    verifications = load_verification_cache(project)
+    decided = load_decisions(project)
+    pending = collect_fill_candidates(verifications, decided=decided)
+
+    console.print(f"[bold]Citations report — {project.name}[/bold]")
+    console.print()
+    console.print(f"document: {doc.document_path}")
+    console.print(f"system:   {doc.detected_system.value}")
+    console.print(f"scanned:  {doc.scanned_at.isoformat()}")
+    console.print()
+
+    table = Table(title="Counts")
+    table.add_column("metric")
+    table.add_column("value", justify="right")
+    for k, v in doc.counts.items():
+        table.add_row(k, str(v))
+    console.print(table)
+    console.print()
+
+    if verifications:
+        matched = sum(1 for v in verifications.values() if v.matched)
+        errors = sum(
+            1 for v in verifications.values() for d in v.discrepancies
+            if d.severity.value == "error"
+        )
+        warnings = sum(
+            1 for v in verifications.values() for d in v.discrepancies
+            if d.severity.value == "warning"
+        )
+        console.print(
+            f"verifier: {matched}/{len(verifications)} matched · "
+            f"{errors} error(s) · {warnings} warning(s) · "
+            f"{len(decided)} decided · {len(pending)} pending"
+        )
+    else:
+        console.print(
+            "[dim]No verification cache — run `lattice citations verify`.[/dim]"
+        )
+
+
 @app.command(name="fill-evidence")
 def fill_evidence(
     project: Path = typer.Argument(...),

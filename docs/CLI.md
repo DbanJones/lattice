@@ -140,6 +140,38 @@ Walk weakly-grounded empirical / methodological / normative / definition claims 
 
 Supporters of the thesis sort first by default. `--supporters-only` filters to just that subset. Idempotent against duplicate citekeys / status tags. Snapshots to `structure/outline.pre-fill-evidence.md`. Decisions logged to `.lattice/fill_evidence_decisions.json`.
 
+## Citation management
+
+A six-phase pipeline for academics who switch citation formats between submissions: scan a document, match inline citations to known sources, verify metadata against Crossref + OpenAlex, fill gaps, then re-emit the whole document in any target style — instantly.
+
+### `lattice citations scan <project> [--document <path>] [--voice academic] [--no-match]`
+
+Scan a document for inline citations, footnotes, and the bibliography section. Detects the citation system in use (`author_date` / `numeric` / `footnote` / `mixed` / `unknown`) and writes `.lattice/document_citations.json`. By default also runs the matcher (links each citation to a known `Source` by surname + year, resolves Ibid./op. cit.). Pure regex/heuristics — no LLM calls.
+
+### `lattice citations verify <project> [--no-cache] [--crossref-only | --openalex-only] [--email <addr>]`
+
+Verify each source against Crossref + OpenAlex in parallel. For every source: lookup by DOI when present, else search by title + author + year. Score the canonical metadata against the paper's; surface field-level discrepancies (`error` for wrong year/title, `warning` for missing DOI, `info` for gap-fills). Cached by source-content hash; re-runs are cheap.
+
+### `lattice citations fill <project> [--severity error|warning|info] [--limit N] [--accept-all-gaps]`
+
+Walk the verifier's discrepancies and accept / reject each. For every disagreeing field, show paper value vs canonical value and prompt: `a` accept canonical · `r` keep paper · `m` manual override · enter skip · `q` quit. Decisions are logged to `.lattice/citation_decisions.json`; re-runs only walk undecided fields. Source records in the source store are updated in place. `--accept-all-gaps` auto-accepts canonical values for info-level gap fills.
+
+### `lattice citations restyle <project> --style <style> [--journal <name>] [--document <path>] [--output <path>] [--voice academic]`
+
+Rewrite a document in a target citation style. Walks every inline citation and the bibliography, re-emits in the new style. Deterministic, no LLM calls — instant style switching. Six base styles supported: `harvard`, `apa`, `chicago_author_date`, `mla`, `vancouver`, `ieee`. Pass `--journal <name>` to apply per-journal overrides on top.
+
+### `lattice citations report <project>`
+
+Print a summary of the project's citation state: scan status, system detected, inline / footnote counts, matched vs unresolved, verification status, error-level discrepancies, undecided fill candidates.
+
+### `lattice citations journals list <project>`
+
+List available per-journal style overrides.
+
+### `lattice citations journals install <project>`
+
+Install the starter library into `voices/journals/` (Nature, Science, IEEE Transactions, British Journal of Political Science, Energy Policy). Idempotent — won't overwrite your customisations.
+
 ## Pipeline commands
 
 ### `lattice run <project> --voice <n> [--with-shadow] [--resume] [--max-passes 3] [--min-delta 5] [--review]`

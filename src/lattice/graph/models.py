@@ -590,6 +590,162 @@ class ScaffoldReport(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────
+# Document-level citations (references package)
+# ─────────────────────────────────────────────────────────
+
+
+class CitationSystem(str, Enum):
+    """Which citation system the document uses.
+
+    Detected by ``references.scanner`` from a sample of inline citations.
+    Drives both the matcher (how to link "(Smith, 2020)" to the
+    bibliography) and the rewriter (which output format to emit).
+    """
+
+    author_date = "author_date"        # (Smith, 2020) — APA, Harvard, Chicago AD
+    numeric = "numeric"                # [12] or (12) — Vancouver, IEEE
+    footnote = "footnote"              # ¹ ² ³ markers, source in footnote text
+    mixed = "mixed"                    # paper uses more than one
+    unknown = "unknown"                # nothing detected
+
+
+class CitationLocationKind(str, Enum):
+    parenthetical = "parenthetical"    # (Smith, 2020)
+    narrative = "narrative"            # Smith (2020) argues
+    numeric = "numeric"                # [12] / (12)
+    footnote_marker = "footnote_marker"  # superscript ¹ in body
+    bibliography = "bibliography"        # entry in the references list
+
+
+class InlineCitation(BaseModel):
+    """A single use of a source in the document body or footnotes.
+
+    Position is recorded as (paragraph_index, char_start, char_end) so
+    the rewriter can replace the span without re-parsing. ``raw_text``
+    preserves the original wording so failed matches surface readable
+    diagnostics. ``source_id`` is None when the matcher couldn't link
+    the citation to a known Source — those become warnings, not errors.
+    """
+
+    citation_id: str                          # stable id within the document
+    raw_text: str
+    kind: CitationLocationKind
+    paragraph_index: int = 0
+    char_start: int = 0
+    char_end: int = 0
+    # Heuristic-extracted bits — what the parser thinks the inline
+    # citation says. Populated for author-date and numeric forms.
+    cited_authors: list[str] = Field(default_factory=list)
+    cited_year: int | None = None
+    cited_number: int | None = None        # for numeric systems
+    pinpoint: str | None = None            # "p. 47" / "ch. 3" / "47-49"
+    # Resolution state.
+    source_id: str | None = None
+    match_confidence: float = 0.0          # 0..1
+    unresolved_reason: str | None = None   # set when source_id is None
+
+
+class FootnoteCitation(BaseModel):
+    """A footnote that contains (or refers to) a citation.
+
+    A footnote may be a full bibliographic entry, a short-form citation
+    (``Smith, op. cit., p. 12``), an ``Ibid.``, or non-citation prose.
+    The ``resolves_to_source_id`` is the source the footnote ultimately
+    points at after ibid/op-cit resolution; it can equal ``source_id``
+    when the footnote IS itself a complete citation.
+    """
+
+    footnote_id: str                       # the marker, e.g. "1" or "²"
+    raw_text: str
+    paragraph_index: int = 0
+    char_start: int = 0
+    char_end: int = 0
+    is_ibid: bool = False
+    is_op_cit: bool = False
+    is_full_citation: bool = False
+    source_id: str | None = None           # the source this footnote IS
+    resolves_to_source_id: str | None = None  # after ibid/op-cit resolution
+    pinpoint: str | None = None
+    unresolved_reason: str | None = None
+
+
+class CitationDiscrepancySeverity(str, Enum):
+    info = "info"
+    warning = "warning"
+    error = "error"
+
+
+class CitationDiscrepancy(BaseModel):
+    """A field-level disagreement between the paper's citation and an
+    external authority (Crossref, OpenAlex, manual)."""
+
+    field: str                             # e.g. "year", "authors", "title", "pages"
+    paper_value: str
+    canonical_value: str
+    severity: CitationDiscrepancySeverity = CitationDiscrepancySeverity.warning
+    note: str = ""
+
+
+class CitationVerifier(str, Enum):
+    crossref = "crossref"
+    openalex = "openalex"
+    doi = "doi"
+    manual = "manual"
+
+
+class CitationVerification(BaseModel):
+    """The result of looking one source up in an external authority."""
+
+    source_id: str
+    verifier: CitationVerifier
+    verified_at: datetime
+    matched: bool                          # did the verifier find ANY record
+    canonical: Citation | None = None      # the verifier's metadata
+    discrepancies: list[CitationDiscrepancy] = Field(default_factory=list)
+    confidence: float = 0.0                # 0..1, set by the matcher
+    note: str = ""                         # free text (e.g. "no DOI; matched by title")
+
+
+class CitationDecision(BaseModel):
+    """Per-source / per-field author decision recorded by the filler.
+
+    Append-only log so re-running fill is idempotent and the author can
+    audit what was canonicalised vs hand-written.
+    """
+
+    source_id: str
+    field: str
+    action: Literal["accept_canonical", "reject", "manual_override"]
+    paper_value: str
+    canonical_value: str | None = None
+    chosen_value: str
+    decided_at: datetime
+    verifier: CitationVerifier | None = None
+
+
+class DocumentCitations(BaseModel):
+    """All citations in one document, persisted to
+    ``.lattice/document_citations.json``.
+
+    The single source of truth the restyle step reads when rewriting
+    the document in a new format. Survives across sessions; is
+    refreshed by ``lattice citations scan``.
+    """
+
+    project_name: str
+    document_path: str
+    detected_system: CitationSystem = CitationSystem.unknown
+    scanned_at: datetime
+    inline_citations: list[InlineCitation] = Field(default_factory=list)
+    footnotes: list[FootnoteCitation] = Field(default_factory=list)
+    bibliography_entries: list[str] = Field(default_factory=list)
+    # Verification state by source_id (most recent verification wins).
+    verifications: dict[str, CitationVerification] = Field(default_factory=dict)
+    # Counts summary so consumers can avoid scanning the full payload.
+    counts: dict[str, int] = Field(default_factory=dict)
+
+
+# ─────────────────────────────────────────────────────────
 # Top-level graph container
 # ─────────────────────────────────────────────────────────
 
