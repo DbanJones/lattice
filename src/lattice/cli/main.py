@@ -309,6 +309,46 @@ def ingest(project: Path = typer.Argument(...)) -> None:
         console.print("[dim]Annotating (inline citations only; install Claude for full annotation)...[/dim]")
 
     known_sources = {s.source_id for s in store.list_sources()}
+
+    # Persist the scaffold report from the markdown ingester before the
+    # annotator runs, so the author can see exactly what the deterministic
+    # parser saw vs what was inferred. The DOCX ingester delegates to the
+    # markdown ingester internally, so it will also have ``last_report``
+    # populated when available.
+    if hasattr(ingester, "save_scaffold_report"):
+        ingester.save_scaffold_report(project, known_source_ids=known_sources)
+
+    # Phase 4: scaffold audit — surface structural issues (empty
+    # sections, orphan claims, missing evidence signals, dangling
+    # relationships, missing conclusion, disconnected thesis) before
+    # the renderer wastes work on a broken graph.
+    from ..auditor.scaffold import audit_scaffold
+    scaffold_report = audit_scaffold(graph)
+    if scaffold_report.findings:
+        report_path = project / ".lattice" / "scaffold_audit.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        # Serialise as a plain JSON list — these are dataclasses, not
+        # pydantic models, so go via dict.
+        import json as _json
+        from dataclasses import asdict as _asdict
+        report_path.write_text(
+            _json.dumps(
+                [_asdict(f) for f in scaffold_report.findings], indent=2
+            ),
+            encoding="utf-8",
+        )
+        if scaffold_report.error_count:
+            console.print(
+                f"[yellow]scaffold audit: {scaffold_report.error_count} "
+                f"error(s), {scaffold_report.warning_count} warning(s) "
+                f"— see .lattice/scaffold_audit.json[/yellow]"
+            )
+        elif scaffold_report.warning_count:
+            console.print(
+                f"[dim]scaffold audit: {scaffold_report.warning_count} "
+                f"warning(s) — see .lattice/scaffold_audit.json[/dim]"
+            )
+
     annotator = ContextualAnnotator(config, llm)
     graph = asyncio.run(annotator.annotate(graph, known_source_ids=known_sources))
 
@@ -1042,6 +1082,527 @@ def voice_review(
         table.add_row(f.layer, f.rule, f.compliance, f.summary[:80])
     console.print(table)
     console.print(f"[green]Report written to {out_path}[/green]")
+
+
+@app.command(name="fill-mechanisms")
+def fill_mechanisms(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(
+        "academic", "--voice", "-v",
+        help="Voice name (used for the report filename only).",
+    ),
+    use_editor: bool = typer.Option(
+        False, "--editor",
+        help="Launch $EDITOR to write each mechanism instead of "
+             "prompting inline. Useful for longer mechanisms.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Walk candidates and prompt, but don't touch outline.md.",
+    ),
+    limit: int = typer.Option(
+        0, "--limit",
+        help="Stop after this many candidates (0 = no limit).",
+    ),
+    min_importance: float = typer.Option(
+        0.5, "--min-importance",
+        help="Skip claims with importance below this floor "
+             "(default 0.5 = no-info default; raise to 0.7 on "
+             "annotated projects to focus on heavy claims).",
+    ),
+) -> None:
+    """Walk empirical / methodological claims that lack a mechanism.
+
+    The most common rescaffold-planner advisory class on real,
+    well-scaffolded papers is `add_mechanism`. Walking it as part of
+    the full rescaffold-apply flow is heavy; this is the focused
+    version: list every claim with importance >= 0.6 and no
+    [mechanism: ...] tag, prompt for a mechanism, append it to the
+    bullet in-place.
+
+    The author graph is NOT mutated — the outline file is the single
+    edit point. Re-ingest after running this to refresh the graph.
+
+    Snapshots `structure/outline.md` to `structure/outline.pre-fill-
+    mechanisms.md` before any edits.
+    """
+    import asyncio as _asyncio
+    import json as _json
+    import os as _os
+    import subprocess as _subprocess
+    import tempfile as _tempfile
+
+    project = _require_project(project)
+    config = Config.load(project)
+
+    structure_dir = project / "structure"
+    outline_path = structure_dir / "outline.md"
+    if not outline_path.exists():
+        console.print(f"[red]No outline at {outline_path}.[/red]")
+        raise typer.Exit(code=3)
+
+    # Re-parse outline to get fresh graph + line numbers.
+    ingester = MarkdownOutlineIngester(config)
+    graph = _asyncio.run(
+        ingester.ingest(outline_path, project_name=project.name)
+    )
+    if ingester.last_report is None:
+        console.print("[red]Ingester didn't produce a scaffold report.[/red]")
+        raise typer.Exit(code=4)
+
+    from ..restructure.fill_mechanisms import (
+        apply_mechanism_edits,
+        collect_candidates,
+        merge_saved_importance_and_mechanism,
+        MechanismEdit,
+    )
+
+    # Merge in the saved graph's annotator-enriched importance +
+    # mechanism. The fresh re-ingest is the source of truth for
+    # structure (line numbers); the saved graph is the source of
+    # truth for derived signal (importance, mechanism).
+    store = GraphStore.load(project)
+    try:
+        saved_graph = store.get_graph()
+    except (FileNotFoundError, KeyError):
+        saved_graph = None
+    if saved_graph is not None:
+        merge_saved_importance_and_mechanism(graph, saved_graph)
+
+    candidates = collect_candidates(
+        graph, ingester.last_report, min_importance=min_importance,
+    )
+    if not candidates:
+        console.print(
+            "[green]No mechanism candidates — every empirical / "
+            "methodological claim above the importance floor already "
+            "has a [mechanism: ...] tag.[/green]"
+        )
+        return
+
+    if limit > 0:
+        candidates = candidates[:limit]
+
+    console.print(
+        f"[cyan]{len(candidates)} mechanism candidate(s).[/cyan] "
+        f"Press [bold]Enter[/bold] alone to skip a claim, "
+        f"[bold]q[/bold] then Enter to quit early."
+    )
+    console.print()
+
+    edits: list[MechanismEdit] = []
+    for i, cand in enumerate(candidates, start=1):
+        console.print(
+            f"[bold]\\[{i}/{len(candidates)}][/bold] "
+            f"[dim]section[/dim] {cand.section_id or '(none)'} "
+            f"[dim]importance[/dim] {cand.importance:.2f} "
+            f"[dim]type[/dim] {cand.claim_type}"
+        )
+        console.print(f"  [yellow]{cand.statement}[/yellow]")
+        if cand.original_excerpt and cand.original_excerpt != cand.statement:
+            console.print(f"  [dim]raw bullet:[/dim] {cand.original_excerpt}")
+        if cand.line is None:
+            console.print(
+                "  [red]no line number — skipping (cannot edit)[/red]"
+            )
+            edits.append(MechanismEdit(candidate=cand, mechanism=""))
+            continue
+
+        if use_editor:
+            mechanism = _prompt_via_editor(cand)
+        else:
+            try:
+                mechanism = typer.prompt(
+                    "  mechanism",
+                    default="",
+                    show_default=False,
+                ).strip()
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[yellow]aborted by user[/yellow]")
+                break
+        if mechanism.lower() == "q":
+            console.print("[yellow]quit early[/yellow]")
+            break
+        edits.append(MechanismEdit(candidate=cand, mechanism=mechanism))
+        console.print()
+
+    if dry_run:
+        applied = sum(1 for e in edits if e.mechanism.strip())
+        console.print(
+            f"[cyan][dry-run][/cyan] would apply {applied} mechanism edit(s) "
+            f"to {outline_path}."
+        )
+        return
+
+    report = apply_mechanism_edits(outline_path, edits, snapshot=True)
+    report.project_name = project.name
+    report.voice_name = voice
+
+    decisions_path = project / ".lattice" / "fill_mechanisms_decisions.json"
+    decisions_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: list = []
+    if decisions_path.exists():
+        try:
+            existing = _json.loads(decisions_path.read_text(encoding="utf-8"))
+            if not isinstance(existing, list):
+                existing = []
+        except _json.JSONDecodeError:
+            existing = []
+    existing.append({
+        "generated_at": report.generated_at.isoformat(),
+        "voice": voice,
+        "candidate_count": report.candidate_count,
+        "edits_applied": report.edits_applied,
+        "edits_skipped": report.edits_skipped,
+        "outline_path": report.outline_path,
+        "snapshot_path": report.snapshot_path,
+        "edits": report.edits,
+    })
+    decisions_path.write_text(
+        _json.dumps(existing, indent=2), encoding="utf-8",
+    )
+
+    console.print(
+        f"[green]Applied {report.edits_applied} mechanism edit(s); "
+        f"skipped {report.edits_skipped}.[/green]"
+    )
+    if report.snapshot_path:
+        console.print(f"  snapshot → {report.snapshot_path}")
+    console.print(f"  decisions → {decisions_path}")
+    console.print(
+        "[dim]Re-run `lattice ingest` (or the Scaffold activity) so "
+        "the graph picks up the new mechanism tags.[/dim]"
+    )
+
+
+def _prompt_via_editor(cand) -> str:
+    """Open $EDITOR with a header + blank line, return the body the
+    user wrote (everything after the first blank line, stripped)."""
+    import os as _os
+    import subprocess as _subprocess
+    import tempfile as _tempfile
+
+    editor = _os.environ.get("EDITOR") or "notepad"
+    header = (
+        f"# Claim {cand.claim_id} (importance {cand.importance:.2f})\n"
+        f"# {cand.statement}\n"
+        f"#\n"
+        f"# Write the mechanism below this line. Save and quit when done.\n"
+        f"# Empty file = skip this claim.\n"
+        f"\n"
+    )
+    with _tempfile.NamedTemporaryFile(
+        suffix=".md", mode="w", delete=False, encoding="utf-8",
+    ) as tf:
+        tf.write(header)
+        tmp_path = tf.name
+    try:
+        _subprocess.call([editor, tmp_path])
+        contents = Path(tmp_path).read_text(encoding="utf-8")
+    finally:
+        try:
+            _os.unlink(tmp_path)
+        except OSError:
+            pass
+    body_lines = [
+        line for line in contents.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    return " ".join(body_lines).strip()
+
+
+@app.command(name="fill-evidence")
+def fill_evidence(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(
+        "academic", "--voice", "-v",
+        help="Voice name (used for the report filename only).",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Walk candidates and prompt, but don't touch outline.md.",
+    ),
+    limit: int = typer.Option(
+        0, "--limit",
+        help="Stop after this many candidates (0 = no limit).",
+    ),
+    min_importance: float = typer.Option(
+        0.5, "--min-importance",
+        help="Skip claims with importance below this floor "
+             "(default 0.5; raise to 0.7 on annotated projects).",
+    ),
+    supporters_only: bool = typer.Option(
+        False, "--supporters-only",
+        help="Only walk claims that transitively support the thesis. "
+             "Use this when you want to focus on the strength-lifting "
+             "subset rather than every weakly-grounded claim.",
+    ),
+) -> None:
+    """Walk weakly-grounded empirical / methodological / normative /
+    definition claims and bind evidence in-place.
+
+    For each candidate, choose:
+      r) [ref: <citekey>] — you know which source backs the claim
+      h) [evidence_status: source_hint] — you've found the source but
+         haven't bound a passage
+      u) [evidence_status: unbound] — explicit acknowledgement of the gap
+      s) convert to [type: user_synthesis] — claim is your own analysis
+      enter) skip
+      q) quit early
+
+    The author graph is NOT mutated — the outline is the single edit
+    point. Re-ingest after running this so the graph picks up the new
+    tags. Snapshots `structure/outline.md` to
+    `structure/outline.pre-fill-evidence.md` before editing.
+    """
+    import asyncio as _asyncio
+    import json as _json
+
+    project = _require_project(project)
+    config = Config.load(project)
+
+    structure_dir = project / "structure"
+    outline_path = structure_dir / "outline.md"
+    if not outline_path.exists():
+        console.print(f"[red]No outline at {outline_path}.[/red]")
+        raise typer.Exit(code=3)
+
+    ingester = MarkdownOutlineIngester(config)
+    graph = _asyncio.run(
+        ingester.ingest(outline_path, project_name=project.name)
+    )
+    if ingester.last_report is None:
+        console.print("[red]Ingester didn't produce a scaffold report.[/red]")
+        raise typer.Exit(code=4)
+
+    from ..restructure.fill_mechanisms import (
+        merge_saved_importance_and_mechanism,
+    )
+    from ..restructure.fill_evidence import (
+        apply_evidence_edits,
+        collect_candidates,
+        EvidenceEdit,
+    )
+
+    store = GraphStore.load(project)
+    try:
+        saved_graph = store.get_graph()
+    except (FileNotFoundError, KeyError):
+        saved_graph = None
+    if saved_graph is not None:
+        merge_saved_importance_and_mechanism(graph, saved_graph)
+
+    candidates = collect_candidates(
+        graph,
+        ingester.last_report,
+        min_importance=min_importance,
+        supporters_first=True,
+    )
+    if supporters_only:
+        candidates = [c for c in candidates if c.is_supporter]
+    if not candidates:
+        console.print(
+            "[green]No evidence candidates — every empirical / "
+            "methodological / normative / definition claim above the "
+            "importance floor is bound or has an explicit "
+            "evidence_status.[/green]"
+        )
+        return
+
+    if limit > 0:
+        candidates = candidates[:limit]
+
+    console.print(
+        f"[cyan]{len(candidates)} evidence candidate(s).[/cyan] "
+        f"Per claim choose: [bold]r[/bold]ef · source-[bold]h[/bold]int · "
+        f"[bold]u[/bold]nbound · [bold]s[/bold]ynthesis · enter to skip · "
+        f"[bold]q[/bold] to quit."
+    )
+    console.print()
+
+    edits: list[EvidenceEdit] = []
+    for i, cand in enumerate(candidates, start=1):
+        marker = " [supports thesis]" if cand.is_supporter else ""
+        console.print(
+            f"[bold]\\[{i}/{len(candidates)}][/bold] "
+            f"[dim]section[/dim] {cand.section_id or '(none)'} "
+            f"[dim]importance[/dim] {cand.importance:.2f} "
+            f"[dim]type[/dim] {cand.claim_type}"
+            f"[yellow]{marker}[/yellow]"
+        )
+        console.print(f"  [yellow]{cand.statement}[/yellow]")
+        if cand.current_status:
+            console.print(
+                f"  [dim]current evidence_status:[/dim] {cand.current_status}"
+            )
+        if cand.line is None:
+            console.print("  [red]no line number — skipping[/red]")
+            edits.append(EvidenceEdit(candidate=cand, action="skip"))
+            continue
+
+        try:
+            choice = typer.prompt(
+                "  action [r/h/u/s/Enter/q]", default="", show_default=False
+            ).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[yellow]aborted by user[/yellow]")
+            break
+        if choice == "q":
+            console.print("[yellow]quit early[/yellow]")
+            break
+        if choice == "" or choice == "skip":
+            edits.append(EvidenceEdit(candidate=cand, action="skip"))
+            console.print()
+            continue
+        if choice == "r":
+            try:
+                citekey = typer.prompt(
+                    "  citekey", default="", show_default=False
+                ).strip()
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[yellow]aborted by user[/yellow]")
+                break
+            if not citekey:
+                edits.append(EvidenceEdit(candidate=cand, action="skip"))
+            else:
+                edits.append(EvidenceEdit(
+                    candidate=cand, action="add_ref", citekey=citekey,
+                ))
+        elif choice == "h":
+            edits.append(EvidenceEdit(candidate=cand, action="set_source_hint"))
+        elif choice == "u":
+            edits.append(EvidenceEdit(candidate=cand, action="set_unbound"))
+        elif choice == "s":
+            edits.append(EvidenceEdit(
+                candidate=cand, action="convert_to_synthesis",
+            ))
+        else:
+            console.print(
+                f"  [yellow]unknown choice {choice!r} — skipping[/yellow]"
+            )
+            edits.append(EvidenceEdit(candidate=cand, action="skip"))
+        console.print()
+
+    if dry_run:
+        applied = sum(1 for e in edits if e.action != "skip")
+        console.print(
+            f"[cyan][dry-run][/cyan] would apply {applied} evidence "
+            f"edit(s) to {outline_path}."
+        )
+        return
+
+    report = apply_evidence_edits(outline_path, edits, snapshot=True)
+    report.project_name = project.name
+    report.voice_name = voice
+
+    decisions_path = project / ".lattice" / "fill_evidence_decisions.json"
+    decisions_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: list = []
+    if decisions_path.exists():
+        try:
+            existing = _json.loads(decisions_path.read_text(encoding="utf-8"))
+            if not isinstance(existing, list):
+                existing = []
+        except _json.JSONDecodeError:
+            existing = []
+    existing.append({
+        "generated_at": report.generated_at.isoformat(),
+        "voice": voice,
+        "candidate_count": report.candidate_count,
+        "edits_applied": report.edits_applied,
+        "edits_skipped": report.edits_skipped,
+        "outline_path": report.outline_path,
+        "snapshot_path": report.snapshot_path,
+        "edits": report.edits,
+    })
+    decisions_path.write_text(
+        _json.dumps(existing, indent=2), encoding="utf-8",
+    )
+
+    console.print(
+        f"[green]Applied {report.edits_applied} evidence edit(s); "
+        f"skipped {report.edits_skipped}.[/green]"
+    )
+    if report.snapshot_path:
+        console.print(f"  snapshot → {report.snapshot_path}")
+    console.print(f"  decisions → {decisions_path}")
+    console.print(
+        "[dim]Re-run `lattice ingest` (or the Scaffold activity) so "
+        "the graph picks up the new evidence tags.[/dim]"
+    )
+
+
+@app.command(name="rescaffold")
+def rescaffold(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(..., "--voice", "-v"),
+    threshold: float = typer.Option(
+        0.5, "--threshold",
+        help="Sub-scores below this trigger structural moves (default 0.5).",
+    ),
+) -> None:
+    """Propose a metrics-driven rescaffold of the document.
+
+    Reads the current author graph and computes argument strength + breadth
+    metrics. For every sub-score below the threshold, generates structural
+    operations (split section, add stub, reorder, move-to-offcuts) and
+    claim-level advisories (bind evidence, add mechanism, diversify
+    sources). Predicts the metric deltas if every operation were applied,
+    so the author can see expected lift before accepting any move.
+
+    Pure analysis — never mutates the graph or the outline. Writes:
+
+    - .lattice/rescaffold_plan.json (machine-readable, with per-op
+      predicted deltas + per-claim claim_size scores)
+    - outputs/rescaffold_plan.<voice>.md (human-readable)
+
+    The output is advisory; a separate apply step (lattice rescaffold-apply,
+    not yet implemented) walks accepted operations and edits the outline
+    after explicit confirmation.
+    """
+    import json as _json
+    project = _require_project(project)
+    Config.load(project)
+    voice_obj = _load_voice(project, voice)
+    store = GraphStore.load(project)
+    graph = store.get_graph()
+    if not graph.claims:
+        console.print(
+            "[red]Author graph is empty. Run `lattice ingest` first.[/red]"
+        )
+        raise typer.Exit(code=3)
+
+    from ..restructure.rescaffold_planner import plan_rescaffold
+    from ..restructure.rescaffold_formatter import format_plan_markdown
+
+    clusters = store.list_clusters()
+    plan = plan_rescaffold(
+        graph, voice_obj, current_clusters=clusters, threshold=threshold,
+    )
+
+    json_path = project / ".lattice" / "rescaffold_plan.json"
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+
+    md_path = project / "outputs" / f"rescaffold_plan.{voice_obj.name}.md"
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.write_text(format_plan_markdown(plan), encoding="utf-8")
+
+    op_count = len(plan.operations)
+    adv_count = len(plan.advisories)
+    if op_count == 0 and adv_count == 0:
+        console.print(
+            "[green]Structure is healthy — every metric is above threshold.[/green]"
+        )
+    else:
+        console.print(
+            f"[cyan]Rescaffold plan:[/cyan] {op_count} operation(s), "
+            f"{adv_count} advisor(y/ies). "
+            f"Predicted Δstrength {plan.expected_strength_delta:+.2f}, "
+            f"Δbreadth {plan.expected_breadth_delta:+.2f}."
+        )
+    console.print(f"  json → {json_path}")
+    console.print(f"  md   → {md_path}")
 
 
 @app.command(name="source-review")

@@ -28,7 +28,7 @@ draft → outputs/paper.<voice>.md (chunked, voice-aware, parallelisable)
 
 ## The activity model
 
-The web UI is organised around six distinct activities. Each is a separate code path with a focused input and output; you can run them individually, chain them via Full Review, or call them from the CLI.
+The web UI is organised around seven distinct activities (six core authoring activities plus a deterministic re-parse). Each is a separate code path with a focused input and output; you can run them individually, chain them via Full Review, or call them from the CLI.
 
 | Activity | Inputs | Output | Notes |
 |---|---|---|---|
@@ -147,5 +147,9 @@ The original [`docs/SPEC.md`](docs/SPEC.md) describes a CLI-only tool with a Ric
 - **Compare** ([`src/lattice/compare/`](src/lattice/compare/)) — cross-project analysis: structural summary plus LLM-driven thesis comparison and claim-pairing across two `author_graph.json` files
 - **Per-section parallel relationship inference** — the original single-call inference capped at "10-30 relationships" was rewritten to chunk by section so each one gets full output budget. A 51-section paper now gets 51 parallel calls, producing ~1-3 connections per claim instead of <0.3
 - **Auto-outliner improvements** — bumped truncation from 24k → 100k chars, removed the "4-7 sections" hard cap, added subsection support, added a `max_depth` parameter the UI exposes as a Section depth picker on Scaffold
+- **Argument metrics** ([`src/lattice/graph/metrics.py`](src/lattice/graph/metrics.py)) — strength + breadth scores computed at ingest time, persisted in `.lattice/scaffold_report.json`. Strength has five sub-scores (direct support, reachable support, evidence backing, counter handling, depth); breadth has six (section diversity, source diversity, claim type diversity, relationship type diversity, mechanism coverage, section spread). Each emits human-readable observations alongside the number so the UI can show *why* a score is what it is.
+- **Per-claim claim_size** ([`src/lattice/graph/claim_size.py`](src/lattice/graph/claim_size.py)) — combines importance (40%), evidence count, mechanism, scope specificity, and relationship density into a 0–1 weight used to drive cluster boundaries, skim-target placement, and offcut decisions.
+- **Rescaffold planner** ([`src/lattice/restructure/rescaffold_planner.py`](src/lattice/restructure/rescaffold_planner.py)) — metrics-driven structural advisor. For each weak metric sub-score, generates structural operations (split section, add stub, reorder, move-to-offcuts) and claim-level advisories (bind evidence, add mechanism, diversify sources, address counters). Predicts metric deltas by applying operations to an in-memory copy and re-running the metric pass. Pure analysis — never mutates the graph. CLI: `lattice rescaffold`. Output: `.lattice/rescaffold_plan.json` + `outputs/rescaffold_plan.<voice>.md`.
+- **Focused walkthrough commands** — `lattice fill-mechanisms` walks empirical/methodological claims missing a `[mechanism: ...]` tag; `lattice fill-evidence` walks weakly-grounded claims with four binding actions (`[ref:]`, source-hint, unbound, convert-to-synthesis). Both edit `outline.md` in place with snapshots, idempotent, decisions logged. The planner's per-real-paper findings showed the dominant work on healthy scaffolds is at the *advisory* level, not the structural level — these commands optimise for that case directly.
 
 Original docs in `docs/` describe the design intent; for ground truth on what runs today, read the code and this README.

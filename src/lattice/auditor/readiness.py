@@ -121,6 +121,12 @@ class DocumentReadinessCheck:
         flags.extend(self._check_document_has_closing_section())
         flags.extend(self._check_no_register_bleed())
         flags.extend(self._check_source_order())
+        # Phase 4b additions — pre-render quality gates (run alongside
+        # the post-render gates above so a single readiness pass surfaces
+        # both kinds of issue).
+        flags.extend(self._check_weak_grounding_marked())
+        flags.extend(self._check_relationship_aware_clusters())
+        flags.extend(self._check_sane_word_ranges())
         is_ready = not flags
         return ReadinessReport(
             is_ready=is_ready,
@@ -334,6 +340,148 @@ class DocumentReadinessCheck:
     def _check_source_order(self) -> list[AuditFlag]:
         from .ordering import OrderingCheck
         return OrderingCheck(self.store, self.voice).check().flags
+
+    # ─── Phase 4b: pre-render quality gates ──────
+
+    def _check_weak_grounding_marked(self) -> list[AuditFlag]:
+        """Empirical / methodological / normative / definition claims
+        that have neither evidence rows nor an ``evidence_status`` are
+        weak grounding — the renderer would emit MISSING_CLAIM markers
+        for them. Flag them BEFORE drafting so the author sees the gap
+        in advance."""
+        from ..graph.models import ClaimType, SectionRole
+        flags: list[AuditFlag] = []
+        graph = self.store.get_graph()
+        sections_by_id = {s.section_id: s for s in graph.sections}
+        clusters_by_claim: dict[str, str] = {}
+        for cluster in self.store.list_clusters():
+            for entry in cluster.claim_sequence:
+                clusters_by_claim[entry.claim_id] = cluster.cluster_id
+
+        needs_evidence = {
+            ClaimType.empirical,
+            ClaimType.methodological,
+            ClaimType.normative,
+            ClaimType.definition,
+        }
+        for claim in graph.claims:
+            if claim.type not in needs_evidence:
+                continue
+            if claim.evidence or claim.evidence_status is not None:
+                continue
+            section = sections_by_id.get(claim.section_id) if claim.section_id else None
+            if section and section.role == SectionRole.references:
+                continue
+            cluster_id = clusters_by_claim.get(claim.claim_id, "")
+            flags.append(self._mk_flag(
+                rule_id="readiness.claim_weak_grounding",
+                cluster_id=cluster_id,
+                section_id=claim.section_id or "",
+                description=(
+                    f"{claim.type.value} claim {claim.claim_id!r} has no "
+                    "Evidence rows and no evidence_status — render will "
+                    "emit a MISSING_CLAIM marker."
+                ),
+                suggestion=(
+                    "Add a [ref:] tag, an [evidence_status: source_hint] / "
+                    "[evidence_status: unbound] tag, or convert the claim "
+                    "to [type: user_synthesis]."
+                ),
+                category=FlagCategory.coverage,
+            ))
+        return flags
+
+    def _check_relationship_aware_clusters(self) -> list[AuditFlag]:
+        """Clusters whose claims are densely connected via sticky
+        relationships (qualifies / extends / depends_on / pivot /
+        contradicts) need every endpoint inside the cluster *or* an
+        ``incoming``/``outgoing`` ClusterRelationshipContext entry that
+        names the other cluster. A cluster with two intra-cluster claims
+        joined by a sticky edge plus zero relationship_context entries
+        means the assembler ran on an older schema and the cluster
+        should be re-planned."""
+        flags: list[AuditFlag] = []
+        graph = self.store.get_graph()
+        sticky_pairs: set[frozenset[str]] = set()
+        from ..graph.models import RelationshipType
+        sticky_types = {
+            RelationshipType.interpretive_pivot,
+            RelationshipType.qualifies,
+            RelationshipType.extends,
+            RelationshipType.depends_on,
+            RelationshipType.contradicts,
+        }
+        for rel in graph.relationships:
+            if rel.type in sticky_types:
+                sticky_pairs.add(frozenset({rel.from_claim, rel.to_claim}))
+
+        for cluster in self.store.list_clusters():
+            ids = {entry.claim_id for entry in cluster.claim_sequence}
+            sticky_inside = sum(
+                1 for pair in sticky_pairs
+                if pair.issubset(ids)
+            )
+            if sticky_inside == 0:
+                continue
+            if cluster.relationship_context:
+                continue
+            flags.append(self._mk_flag(
+                rule_id="readiness.cluster_missing_relationship_context",
+                cluster_id=cluster.cluster_id,
+                section_id=cluster.section_id,
+                description=(
+                    f"Cluster {cluster.cluster_id} contains "
+                    f"{sticky_inside} sticky-edge pair(s) but has no "
+                    "relationship_context payload — re-run the planner "
+                    "so the renderer sees the relationships."
+                ),
+                suggestion="Run `lattice plan` (or the Scaffold activity) again.",
+                category=FlagCategory.coverage,
+            ))
+        return flags
+
+    def _check_sane_word_ranges(self) -> list[AuditFlag]:
+        """Cluster target_words must define a usable band: min ≤ max,
+        min ≥ 80 (smaller than that and the renderer can't develop the
+        claims at all), max ≤ 800 (larger and a single cluster blows
+        the chunked-renderer's per-call budget). Out-of-band ranges are
+        usually a sign the assembler ran on a malformed claim_count."""
+        flags: list[AuditFlag] = []
+        for cluster in self.store.list_clusters():
+            issues: list[str] = []
+            if cluster.target_words_min > cluster.target_words_max:
+                issues.append(
+                    f"min ({cluster.target_words_min}) > max "
+                    f"({cluster.target_words_max})"
+                )
+            if cluster.target_words_min < 80:
+                issues.append(
+                    f"min ({cluster.target_words_min}) below the 80-word "
+                    "renderer floor"
+                )
+            if cluster.target_words_max > 800:
+                issues.append(
+                    f"max ({cluster.target_words_max}) above the 800-word "
+                    "chunked-renderer cap"
+                )
+            if not issues:
+                continue
+            flags.append(self._mk_flag(
+                rule_id="readiness.cluster_word_range_unsane",
+                cluster_id=cluster.cluster_id,
+                section_id=cluster.section_id,
+                description=(
+                    f"Cluster {cluster.cluster_id} has an unworkable "
+                    f"target_words band: {'; '.join(issues)}."
+                ),
+                suggestion=(
+                    "Re-run `lattice plan` after pruning or splitting the "
+                    "cluster's claims; or set explicit `[words: ...]` tags "
+                    "on the claims to control density."
+                ),
+                category=FlagCategory.architecture,
+            ))
+        return flags
 
     # ─── helpers ────────────────────────────────
 

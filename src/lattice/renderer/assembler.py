@@ -24,8 +24,12 @@ from ..graph.models import (
     ClaimRoleInCluster,
     ClaimType,
     Cluster,
+    ClusterRelationshipContext,
     ClusterRole,
     Confidence,
+    Relationship,
+    RelationshipStrength,
+    RelationshipType,
     Section,
 )
 from ..graph.store import GraphStore
@@ -40,6 +44,21 @@ _CLUSTER_BOUNDARY_ROLES = {ClusterRole.synthesis, ClusterRole.conclusion}
 
 _MIN_CLUSTER_SIZE = 1
 _MAX_CLUSTER_SIZE = 4
+
+# Relationship types that mean "these two claims belong in one paragraph
+# if at all possible". The assembler will avoid splitting an adjacent
+# pair joined by one of these (subject to the max-cluster-size cap), and
+# will run a post-pass that merges adjacent clusters when one of these
+# bridges them. ``interpretive_pivot`` is the sharpest case: it's the
+# whole point of the move that the two claims sit together.
+_STICKY_RELATIONSHIP_TYPES: frozenset[RelationshipType] = frozenset({
+    RelationshipType.interpretive_pivot,
+    RelationshipType.qualifies,
+    RelationshipType.extends,
+    RelationshipType.depends_on,
+    RelationshipType.contradicts,
+    RelationshipType.is_counterexample_to,
+})
 
 # Cluster word target = source content words * this factor. Set high
 # enough that Claude has to genuinely expand the source content rather
@@ -65,6 +84,19 @@ class Assembler:
         graph = self.store.get_graph()
         claims_by_id = {c.claim_id: c for c in graph.claims}
 
+        # Index relationships once so the section builder can look up
+        # sticky pairs in O(1). Edges with from/to claims that aren't
+        # in claims_by_id are dropped (defensive — the differ should
+        # have already pruned dangling edges, but a stale cluster_plan
+        # against a freshly-edited graph can still hit this).
+        rels_from: dict[str, list[Relationship]] = {}
+        rels_to: dict[str, list[Relationship]] = {}
+        for rel in graph.relationships:
+            if rel.from_claim not in claims_by_id or rel.to_claim not in claims_by_id:
+                continue
+            rels_from.setdefault(rel.from_claim, []).append(rel)
+            rels_to.setdefault(rel.to_claim, []).append(rel)
+
         # Preserve render state from any previous plan so re-planning
         # doesn't trigger unnecessary re-renders for unchanged clusters.
         existing_by_id = {c.cluster_id: c for c in self.store.list_clusters()}
@@ -81,7 +113,9 @@ class Assembler:
         for section in graph.sections:
             if section.role == SectionRole.references:
                 continue
-            section_clusters = self._build_section_clusters(section, claims_by_id)
+            section_clusters = self._build_section_clusters(
+                section, claims_by_id, rels_from, rels_to,
+            )
             clusters.extend(section_clusters)
 
         # 3. Transitions (requires full cluster list for neighbour lookup).
@@ -90,7 +124,16 @@ class Assembler:
         # 4. Citation strategy (document-wide first-mention tracking).
         self._plan_citation_strategy(clusters, claims_by_id)
 
-        # Carry over prose state from the previous plan where IDs still match.
+        # 5. Relationship context — compute intra/incoming/outgoing edges
+        # per cluster so the renderer can shape paragraphs around them.
+        self._populate_relationship_context(clusters, graph)
+
+        # Carry over prose state from the previous plan where IDs still
+        # match. If the rendering-affecting relationship context has
+        # changed since the cluster was last rendered, escalate state to
+        # ``dirty`` so the renderer re-runs — newly-inferred or removed
+        # edges meaningfully change paragraph shape.
+        from ..graph.models import ProseState
         for cluster in clusters:
             old = existing_by_id.get(cluster.cluster_id)
             if old is None:
@@ -100,6 +143,16 @@ class Assembler:
             cluster.last_rendered_hash = old.last_rendered_hash
             cluster.last_render_token_count = old.last_render_token_count
             cluster.prose_file = old.prose_file
+
+            old_sig = _relationship_signature(getattr(old, "relationship_context", []))
+            new_sig = _relationship_signature(cluster.relationship_context)
+            if (
+                old_sig != new_sig
+                and cluster.prose_state in (
+                    ProseState.generated, ProseState.edited, ProseState.needs_review
+                )
+            ):
+                cluster.prose_state = ProseState.dirty
 
         # Persist. Rewrite cluster_plan.json from scratch so orphaned clusters
         # (e.g. from sections now flagged references) don't linger on disk.
@@ -132,7 +185,11 @@ class Assembler:
     # ─── 2. Cluster construction ───────────────────────
 
     def _build_section_clusters(
-        self, section: Section, claims_by_id: dict[str, Claim]
+        self,
+        section: Section,
+        claims_by_id: dict[str, Claim],
+        rels_from: dict[str, list[Relationship]],
+        rels_to: dict[str, list[Relationship]],
     ) -> list[Cluster]:
         ordered = [
             claims_by_id[cid]
@@ -147,20 +204,47 @@ class Assembler:
         # relative position.
         ordered.sort(key=lambda c: c.source_order)
 
+        # Build a "sticky pair" set: pairs of claims joined by a sticky
+        # relationship type, restricted to claims in this section's
+        # ordered set. We keep it undirected — the rendering doesn't
+        # care which direction the edge runs in.
+        ordered_ids = {c.claim_id for c in ordered}
+        sticky_pairs: set[frozenset[str]] = set()
+        for claim in ordered:
+            for rel in rels_from.get(claim.claim_id, []):
+                if rel.type in _STICKY_RELATIONSHIP_TYPES and rel.to_claim in ordered_ids:
+                    sticky_pairs.add(frozenset({rel.from_claim, rel.to_claim}))
+
+        def _sticky_to_any_in(claim: Claim, others: list[Claim]) -> bool:
+            for other in others:
+                if frozenset({claim.claim_id, other.claim_id}) in sticky_pairs:
+                    return True
+            return False
+
         groups: list[list[Claim]] = []
         current: list[Claim] = []
 
-        for claim in ordered:
+        # Walk by index so we can peek the next claim in O(1); the old
+        # ``ordered.index(claim)`` lookup was O(n²) for large sections.
+        for i, claim in enumerate(ordered):
             role = _role_for_claim(claim)
             current.append(claim)
-            # Break if we've hit the max OR we just consumed a boundary role
-            # and already have 2+ claims in the cluster.
-            if len(current) >= _MAX_CLUSTER_SIZE:
-                groups.append(current)
-                current = []
-            elif role in _CLUSTER_BOUNDARY_ROLES and len(current) >= 2:
-                groups.append(current)
-                current = []
+            at_max = len(current) >= _MAX_CLUSTER_SIZE
+            at_boundary = role in _CLUSTER_BOUNDARY_ROLES and len(current) >= 2
+            if not (at_max or at_boundary):
+                continue
+
+            # We'd otherwise close the current cluster here. Before doing
+            # that, check whether the *next* claim is sticky-bound to
+            # anything in the current cluster — if so, defer the break
+            # so the related pair stays together (subject to max size).
+            if not at_max and i + 1 < len(ordered):
+                next_claim = ordered[i + 1]
+                if _sticky_to_any_in(next_claim, current):
+                    continue
+
+            groups.append(current)
+            current = []
         if current:
             groups.append(current)
 
@@ -168,6 +252,24 @@ class Assembler:
         if len(groups) >= 2 and len(groups[-1]) == 1 and len(groups[-2]) < _MAX_CLUSTER_SIZE:
             groups[-2].extend(groups[-1])
             groups.pop()
+
+        # Final pass: if two adjacent clusters are bridged by a sticky
+        # relationship and the merged size would not exceed the cap,
+        # merge them. Catches cases the streaming pass couldn't (e.g. a
+        # qualifies-edge that points backward across a boundary role).
+        merged: list[list[Claim]] = []
+        for group in groups:
+            if merged:
+                prev = merged[-1]
+                bridged = any(
+                    frozenset({a.claim_id, b.claim_id}) in sticky_pairs
+                    for a in prev for b in group
+                )
+                if bridged and len(prev) + len(group) <= _MAX_CLUSTER_SIZE:
+                    prev.extend(group)
+                    continue
+            merged.append(group)
+        groups = merged
 
         clusters: list[Cluster] = []
         # ``section_letter`` is used as the readable cluster-id prefix.
@@ -241,6 +343,82 @@ class Assembler:
             else:
                 cluster.transition_out_hint = (
                     "This is the final cluster in its section. End emphatically."
+                )
+
+    # ─── 5. Relationship context ───────────────────────
+
+    def _populate_relationship_context(
+        self, clusters: list[Cluster], graph: AuthorGraph,
+    ) -> None:
+        """For each cluster, attach the edges that touch its claims.
+
+        Each edge produces at most one ``ClusterRelationshipContext``
+        per cluster:
+
+        - Both endpoints in the same cluster → ``intra``.
+        - One endpoint in this cluster, the other elsewhere → ``incoming``
+          (this cluster owns the ``to`` end) or ``outgoing`` (this
+          cluster owns the ``from`` end).
+
+        ``affects_rendering`` is True for edges whose type matters for
+        paragraph shape (the sticky set plus the canonical
+        supports/contradicts/is_evidence_for triplet); False for
+        unlabelled / inferred edges.
+        """
+        # Build a claim → cluster index for O(1) lookup of "where does
+        # the other endpoint live?".
+        cluster_for_claim: dict[str, str] = {}
+        section_for_cluster: dict[str, str] = {}
+        for cluster in clusters:
+            section_for_cluster[cluster.cluster_id] = cluster.section_id
+            for entry in cluster.claim_sequence:
+                cluster_for_claim[entry.claim_id] = cluster.cluster_id
+
+        renderable_types = _STICKY_RELATIONSHIP_TYPES | {
+            RelationshipType.supports,
+            RelationshipType.is_evidence_for,
+        }
+
+        for cluster in clusters:
+            cluster.relationship_context = []
+            in_cluster = {entry.claim_id for entry in cluster.claim_sequence}
+
+            for rel in graph.relationships:
+                from_in = rel.from_claim in in_cluster
+                to_in = rel.to_claim in in_cluster
+                if not (from_in or to_in):
+                    continue
+
+                if from_in and to_in:
+                    direction = "intra"
+                    other_cluster_id = None
+                elif from_in:
+                    direction = "outgoing"
+                    other_cluster_id = cluster_for_claim.get(rel.to_claim)
+                else:  # to_in
+                    direction = "incoming"
+                    other_cluster_id = cluster_for_claim.get(rel.from_claim)
+
+                other_section_id = (
+                    section_for_cluster.get(other_cluster_id)
+                    if other_cluster_id
+                    else None
+                )
+                affects = rel.type in renderable_types
+
+                cluster.relationship_context.append(
+                    ClusterRelationshipContext(
+                        rel_id=rel.rel_id,
+                        type=rel.type,
+                        strength=rel.strength,
+                        note=rel.note or "",
+                        direction=direction,
+                        from_claim=rel.from_claim,
+                        to_claim=rel.to_claim,
+                        other_cluster_id=other_cluster_id,
+                        other_section_id=other_section_id,
+                        affects_rendering=affects,
+                    )
                 )
 
     # ─── 4. Citation strategy ──────────────────────────
@@ -336,6 +514,26 @@ def _collect_sources(claims: list[Claim]) -> list[str]:
                 seen.append(ev.source)
                 seen_set.add(ev.source)
     return seen
+
+
+def _relationship_signature(
+    rel_context: list[ClusterRelationshipContext],
+) -> tuple:
+    """Deterministic, comparable summary of a cluster's
+    rendering-affecting relationship context.
+
+    Two contexts with the same set of intra/incoming/outgoing edge
+    triples (type, from, to, direction) produce the same signature, so
+    re-running the assembler doesn't churn cluster state when nothing
+    actually changed. Edges with ``affects_rendering=False`` are
+    excluded — they don't drive prose shape, so changes to them
+    shouldn't trigger re-renders.
+    """
+    return tuple(sorted(
+        (r.type.value, r.from_claim, r.to_claim, r.direction)
+        for r in rel_context
+        if r.affects_rendering
+    ))
 
 
 def _identify_positioning(

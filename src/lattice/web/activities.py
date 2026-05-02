@@ -350,6 +350,9 @@ async def _activity_ingest(
 
     store = GraphStore.load(project)
     store.save_graph(graph)
+    if hasattr(ingester, "save_scaffold_report"):
+        known = {s.source_id for s in store.list_sources()}
+        ingester.save_scaffold_report(project, known_source_ids=known)
     progress.end(
         "ingest",
         status=f"{len(graph.sections)} sections, {len(graph.claims)} claims",
@@ -409,13 +412,14 @@ async def _activity_scaffold(
         progress._emit({"type": "run_failed", "reason": "no_outline"})
         return
 
+    auto_outliner_summary: Any = None
     if outline_path.suffix.lower() in (".md", ".markdown", ".txt"):
         from ..ingester.auto_outliner import (
             append_conclusion_section,
             has_conclusion_section,
             looks_like_lattice_outline,
             normalise_to_user_synthesis,
-            structure_outline,
+            structure_outline_with_report,
             write_structured_outline,
         )
         try:
@@ -430,7 +434,7 @@ async def _activity_scaffold(
                 "structure_outline",
                 status="raw prose detected — extracting structure",
             )
-            structured = await structure_outline(
+            structured, auto_outliner_summary = await structure_outline_with_report(
                 raw_text, llm, max_depth=request.nesting_depth,
             )
             outline_path = write_structured_outline(
@@ -496,6 +500,13 @@ async def _activity_scaffold(
     )
     store = GraphStore.load(project)
     store.save_graph(graph)
+    if hasattr(ingester, "save_scaffold_report"):
+        known = {s.source_id for s in store.list_sources()}
+        ingester.save_scaffold_report(
+            project,
+            known_source_ids=known,
+            auto_outliner_summary=auto_outliner_summary,
+        )
     progress.end(
         "ingest",
         status=f"{len(graph.sections)} sections, {len(graph.claims)} claims",
@@ -559,6 +570,26 @@ async def _activity_scaffold(
                 "relationship_inference",
                 status=f"+{added} relationship(s)",
             )
+            # Re-run the planner so the new edges flow into each cluster's
+            # ``relationship_context`` and clusters whose intra-cluster
+            # rendering signature changed get marked dirty (forcing
+            # re-render on the next draft).
+            if added:
+                dirty_before = sum(
+                    1 for c in store.list_clusters()
+                    if c.prose_state.value == "dirty"
+                )
+                await Assembler(config, store, llm=None, voice=voice).build_plan()
+                dirty_after = sum(
+                    1 for c in store.list_clusters()
+                    if c.prose_state.value == "dirty"
+                )
+                marked = max(0, dirty_after - dirty_before)
+                if marked:
+                    result.notes.append(
+                        f"Inferred relationships marked {marked} cluster(s) "
+                        "dirty — re-render on next draft."
+                    )
         except Exception as exc:  # noqa: BLE001
             progress.end(
                 "relationship_inference",

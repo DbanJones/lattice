@@ -1246,6 +1246,63 @@ def test_graph_viz_regenerates_when_graph_is_newer(
     )
 
 
+def test_graph_viz_regenerates_when_cluster_plan_is_newer(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Phase 3: cluster_plan.json changes should also invalidate the
+    cached graph-viz HTML, since cluster compound nodes + render-state
+    badges come from the plan, not the graph."""
+    import os as _os, time as _time
+    project = tmp_path / "demo"
+    viz_path = project / "outputs" / "argument_graph.html"
+    cluster_path = project / ".lattice" / "cluster_plan.json"
+
+    resp1 = client.get("/api/projects/demo/graph-viz")
+    assert resp1.status_code == 200
+    first_mtime = viz_path.stat().st_mtime
+
+    if not cluster_path.exists():
+        cluster_path.parent.mkdir(parents=True, exist_ok=True)
+        cluster_path.write_text("[]", encoding="utf-8")
+    new_t = _time.time() + 10
+    _os.utime(cluster_path, (new_t, new_t))
+    assert cluster_path.stat().st_mtime > viz_path.stat().st_mtime
+
+    resp2 = client.get("/api/projects/demo/graph-viz")
+    assert resp2.status_code == 200
+    assert viz_path.stat().st_mtime > first_mtime, (
+        "graph-viz should regenerate when cluster_plan.json is newer"
+    )
+
+
+def test_graph_viz_regenerates_when_audit_dir_changes(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Phase 3: audit/readiness output changes should invalidate the
+    cached HTML, since cluster compound nodes carry audit-flag and
+    blocks-readiness badges."""
+    import os as _os, time as _time
+    project = tmp_path / "demo"
+    viz_path = project / "outputs" / "argument_graph.html"
+    audit_dir = project / ".lattice" / "audit"
+
+    resp1 = client.get("/api/projects/demo/graph-viz")
+    assert resp1.status_code == 200
+    first_mtime = viz_path.stat().st_mtime
+
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    flag_path = audit_dir / "audit_flags.json"
+    flag_path.write_text("[]", encoding="utf-8")
+    new_t = _time.time() + 10
+    _os.utime(flag_path, (new_t, new_t))
+
+    resp2 = client.get("/api/projects/demo/graph-viz")
+    assert resp2.status_code == 200
+    assert viz_path.stat().st_mtime > first_mtime, (
+        "graph-viz should regenerate when audit/* changes"
+    )
+
+
 def test_harvard_bibliography_includes_doi_url() -> None:
     """The bibliography string should embed a https://doi.org/...
     URL when a DOI is present, so the frontend's autolink regex

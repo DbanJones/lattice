@@ -115,6 +115,21 @@ class BindingStrength(str, Enum):
     contradictory = "contradictory"
 
 
+class EvidenceStatus(str, Enum):
+    """Author-declared (or auto-derived) state of a claim's evidence backing.
+
+    Distinct from ``BindingStrength`` (which lives on each individual Evidence
+    entry). EvidenceStatus is a claim-level summary the author can assert in
+    the outline so the scaffold audit can act on intent, not just the absence
+    of an Evidence row. The renderer / coverage check treats it as advisory
+    and falls back to deriving from the ``evidence`` list when unset.
+    """
+
+    unbound = "unbound"           # claim has no evidence yet, intentionally
+    source_hint = "source_hint"   # author has a citation hint but no precise binding
+    bound = "bound"                # claim is bound to specific passage(s)
+
+
 class Evidence(BaseModel):
     source: str  # source_id
     passage: str  # passage_id
@@ -146,8 +161,14 @@ class Claim(BaseModel):
     # Importance to the document thesis, 0..1. Computed by the
     # whole-document annotator pass after all claims are read; used
     # for visualisation node sizing, renderer word-budget allocation,
-    # and surfacing low-importance claims as skip candidates.
+    # and surfacing low-importance claims as skip candidates. The
+    # ingester also accepts an explicit ``[importance: 0.8]`` tag.
     importance: float = 0.5
+    # Author's declared evidence state — set by ``[evidence_status: ...]``
+    # in the outline, or left None to let downstream code derive it from
+    # the ``evidence`` list. Read by the scaffold audit and the renderer
+    # readiness gate.
+    evidence_status: EvidenceStatus | None = None
     created_by: str
     created_at: datetime
     modified_at: datetime
@@ -283,6 +304,35 @@ class ProseState(str, Enum):
     needs_review = "needs_review"
 
 
+class ClusterRelationshipContext(BaseModel):
+    """A relationship surfaced as context for cluster rendering.
+
+    Captures intra-cluster edges (both endpoints inside the cluster),
+    incoming edges (some other cluster's claim → a claim in this cluster),
+    and outgoing edges (a claim in this cluster → some other cluster's
+    claim). The renderer uses ``intra`` edges to drive paragraph shape
+    (e.g. ``interpretive_pivot`` becomes a sharp two-move structure) and
+    ``incoming``/``outgoing`` edges to drive transitions.
+    """
+
+    rel_id: str
+    type: RelationshipType
+    strength: RelationshipStrength
+    note: str = ""
+    direction: Literal["intra", "incoming", "outgoing"]
+    from_claim: str
+    to_claim: str
+    # The cluster on the other end of the edge. ``None`` when the edge
+    # is intra-cluster, or when the other endpoint isn't assigned to any
+    # cluster (e.g. the thesis claim, or a claim in a references section).
+    other_cluster_id: str | None = None
+    other_section_id: str | None = None
+    # Whether the renderer should treat this edge as load-bearing for
+    # prose shape. Intra-cluster pivot/qualifies/contradicts are always
+    # True; weak inferred edges may be False.
+    affects_rendering: bool = True
+
+
 class Cluster(BaseModel):
     cluster_id: str
     section_id: str
@@ -296,6 +346,14 @@ class Cluster(BaseModel):
     citation_strategy: CitationStrategy = Field(default_factory=CitationStrategy)
     transition_in_hint: str = ""
     transition_out_hint: str = ""
+    # Relationship payload used by the renderer for paragraph shape and
+    # transitions. Populated by the assembler from the author graph;
+    # optional with default empty list so older serialised plans still
+    # load. Re-running the assembler refreshes this list, so it is safe
+    # to treat as derivable.
+    relationship_context: list[ClusterRelationshipContext] = Field(
+        default_factory=list
+    )
     prose_state: ProseState = ProseState.not_yet_rendered
     prose_file: str | None = None
     last_rendered_at: datetime | None = None
@@ -423,6 +481,112 @@ class ShadowDiff(BaseModel):
     decision: Literal["accept", "accept_with_edit", "reject", "defer"] | None = None
     decision_at: datetime | None = None
     decision_rationale: str | None = None
+
+
+# ─────────────────────────────────────────────────────────
+# Scaffold ingest diagnostics
+# ─────────────────────────────────────────────────────────
+
+
+class ScaffoldWarningLevel(str, Enum):
+    info = "info"
+    warning = "warning"
+    error = "error"
+
+
+class ScaffoldWarning(BaseModel):
+    """A diagnostic raised during scaffold ingest.
+
+    Distinct from AuditFlag (which is a post-render finding on prose) — these
+    are pre-render parse-time issues: malformed tags, unresolved relationship
+    targets, references to citekeys not in the source store, etc.
+    """
+
+    level: ScaffoldWarningLevel = ScaffoldWarningLevel.warning
+    code: str
+    message: str
+    claim_id: str | None = None
+    section_id: str | None = None
+    line: int | None = None
+    raw: str | None = None
+
+
+class ScaffoldClaimReport(BaseModel):
+    """Per-claim diagnostics emitted during ingest. Lets the author see what
+    the parser actually extracted vs what they wrote, which references didn't
+    resolve, and how confident the parser was.
+
+    ``cited_refs`` is the immutable record of every ``[ref:]`` the author
+    wrote on this claim. ``unresolved_refs`` is the subset that don't
+    resolve to a known indexed source — recomputed from ``cited_refs``
+    on each save, so re-running with a different ``known_source_ids`` is
+    idempotent (a previously-stripped ref can come back if the source is
+    later removed from the index).
+    """
+
+    claim_id: str
+    section_id: str | None = None
+    original_excerpt: str = ""
+    extracted_statement: str = ""
+    confidence: float = 1.0  # parser's confidence in its extraction, 0..1
+    cited_refs: list[str] = Field(default_factory=list)
+    unresolved_refs: list[str] = Field(default_factory=list)
+    unresolved_targets: list[str] = Field(default_factory=list)
+    warnings: list[ScaffoldWarning] = Field(default_factory=list)
+    # 1-indexed line number in the source outline file. Used by tools
+    # like ``lattice fill-mechanisms`` to locate the bullet for in-place
+    # editing without re-parsing. ``None`` for synthetic claims (e.g.
+    # the thesis claim, which is built from the THESIS block, not a
+    # bullet).
+    line: int | None = None
+
+
+class AutoOutlinerSummary(BaseModel):
+    """Embedded inside a ``ScaffoldReport`` when the markdown that was
+    parsed was first produced by the LLM auto-outliner. Records how rich
+    the LLM's output was so the author can tell whether a flat-looking
+    scaffold is a parser problem or a Claude problem."""
+
+    generated_at: datetime
+    max_depth: int
+    section_count: int = 0
+    claim_count: int = 0
+    typed_claim_count: int = 0
+    user_synthesis_claim_count: int = 0
+    mechanism_claim_count: int = 0
+    evidence_hint_count: int = 0
+    importance_set_count: int = 0
+    relationship_tag_count: int = 0
+    warnings: list[ScaffoldWarning] = Field(default_factory=list)
+    raw_response_preview: str = ""
+
+
+class ScaffoldReport(BaseModel):
+    """Diagnostic artefact persisted to ``.lattice/scaffold_report.json``.
+
+    Captures everything the ingester noticed but couldn't safely escalate to
+    a hard parse error. Read by the scaffold audit (Phase 4) and surfaced in
+    the web UI so the author can fix issues before drafting.
+    """
+
+    project_name: str
+    source_file: str = ""
+    generated_at: datetime
+    parser: str = "markdown_ingester"
+    claim_reports: list[ScaffoldClaimReport] = Field(default_factory=list)
+    warnings: list[ScaffoldWarning] = Field(default_factory=list)
+    # Lightweight summary so consumers can avoid scanning the full payload.
+    counts: dict[str, int] = Field(default_factory=dict)
+    # Populated when the outline that was parsed had been generated by
+    # the LLM auto-outliner — lets the author see how much was inferred
+    # from raw prose vs hand-tagged.
+    auto_outliner: AutoOutlinerSummary | None = None
+    # Strength + breadth metrics computed against the parsed graph.
+    # Lazily populated by ``MarkdownOutlineIngester.save_scaffold_report``
+    # (uses ``graph.metrics.compute_argument_metrics``); ``None`` when
+    # the report was emitted before metrics were wired in or when the
+    # caller chose to skip the computation.
+    argument_metrics: dict | None = None
 
 
 # ─────────────────────────────────────────────────────────

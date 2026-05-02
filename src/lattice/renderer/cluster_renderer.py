@@ -529,6 +529,8 @@ def _build_user_prompt(
     else:
         partial_note = "\n<render_mode>FULL: every claim is grounded.</render_mode>\n"
 
+    relationships_block = _format_relationship_context(cluster)
+
     return f"""<section_context>
 Section: {section_title}
 Section role: {section_role}
@@ -547,6 +549,10 @@ Target words: {cluster.target_words_min}-{cluster.target_words_max}
 <claims>
 {claims_xml}
 </claims>
+
+<relationships>
+{relationships_block}
+</relationships>
 
 <citation_strategy>
 synthesis_required: {str(cit.synthesis_required).lower()}
@@ -664,6 +670,44 @@ def _format_claims_xml(
             f"</claim>"
         )
     return "\n".join(blocks) or "(no claims)"
+
+
+def _format_relationship_context(cluster: Cluster) -> str:
+    """Render the cluster's ``relationship_context`` as a bullet list the
+    LLM can read alongside the ``<claims>`` block. Intra-cluster edges
+    come first (they shape paragraph structure); incoming edges next
+    (they constrain the opening); outgoing edges last (they constrain
+    the close). Edges with ``affects_rendering=False`` are omitted —
+    they're metadata for the diagram, not directives for the renderer."""
+    if not cluster.relationship_context:
+        return "(no recorded relationships touching this cluster)"
+    intra = [r for r in cluster.relationship_context if r.direction == "intra" and r.affects_rendering]
+    incoming = [r for r in cluster.relationship_context if r.direction == "incoming" and r.affects_rendering]
+    outgoing = [r for r in cluster.relationship_context if r.direction == "outgoing" and r.affects_rendering]
+
+    def _row(rel) -> str:
+        target = (
+            f" → cluster {rel.other_cluster_id}" if rel.other_cluster_id else ""
+        )
+        note = f" — {rel.note}" if rel.note else ""
+        return (
+            f"  - {rel.from_claim} -[{rel.type.value} ({rel.strength.value})]-> "
+            f"{rel.to_claim}{target}{note}"
+        )
+
+    sections: list[str] = []
+    if intra:
+        sections.append("intra-cluster (use these to shape the paragraph structure):")
+        sections.extend(_row(r) for r in intra)
+    if incoming:
+        sections.append("incoming (the opening should pick these up):")
+        sections.extend(_row(r) for r in incoming)
+    if outgoing:
+        sections.append("outgoing (the close should set these up):")
+        sections.extend(_row(r) for r in outgoing)
+    if not sections:
+        return "(no rendering-affecting relationships)"
+    return "\n".join(sections)
 
 
 def _format_prohibitions(prohibitions: list) -> str:

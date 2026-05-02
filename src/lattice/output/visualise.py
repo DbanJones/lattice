@@ -25,8 +25,11 @@ from rich.tree import Tree
 
 from ..graph.models import (
     AuthorGraph,
+    BindingStrength,
     ClaimType,
     Cluster,
+    EvidenceStatus,
+    ProseState,
     RelationshipType,
     SectionRole,
 )
@@ -261,52 +264,268 @@ _SECTION_PALETTE = [
 ]
 
 
-def render_html(graph: AuthorGraph) -> str:
-    """Self-contained HTML page with cytoscape.js loading the graph as JSON.
+# ─── Phase 3: enriched visualisation payload ──────
 
-    Design: claims are flat nodes (no compound parents — they wreck cose
-    layout when sections are large). Each claim is colour-coded by its
-    section; the section legend lives in a fixed sidebar. Skipped
-    sections (e.g. references) are excluded from the graph entirely.
+
+def _evidence_quality(claim) -> str:
+    """Reduce a claim's evidence list to a single quality bucket the
+    diagram can colour-code."""
+    if claim.evidence_status == EvidenceStatus.bound:
+        return "bound"
+    if claim.evidence_status == EvidenceStatus.source_hint:
+        return "source_hint"
+    if claim.evidence_status == EvidenceStatus.unbound:
+        return "unbound"
+    if not claim.evidence:
+        return "unbound" if not claim.author_origin else "author"
+    strengths = [ev.binding_strength for ev in claim.evidence]
+    if any(s == BindingStrength.contradictory for s in strengths):
+        return "contradictory"
+    if any(s == BindingStrength.strong for s in strengths):
+        return "bound"
+    if any(s == BindingStrength.weak for s in strengths):
+        return "source_hint"
+    return "unbound"
+
+
+def _claim_has_unrenderable_marker(prose_path: Path | None) -> bool:
+    if prose_path is None or not prose_path.exists():
+        return False
+    try:
+        text = prose_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return "{MISSING_CLAIM" in text or "{CLUSTER_UNRENDERABLE" in text
+
+
+def build_visualisation_payload(
+    graph: AuthorGraph,
+    clusters: list[Cluster] | None = None,
+    *,
+    drafts_dir: Path | None = None,
+    audit_flags_by_cluster: dict[str, int] | None = None,
+    readiness_blocking_clusters: set[str] | None = None,
+    section_palette: list[str] | None = None,
+) -> dict:
+    """Build the full payload the cytoscape diagram (and any other
+    consumer) reads. Pure function over the inputs — no I/O beyond an
+    optional ``drafts_dir`` peek for unrenderable markers.
+
+    Top-level keys:
+
+    - ``meta``: counts + lattice version stamp
+    - ``sections``: hierarchy (parent, depth, role, color, counts)
+    - ``clusters``: per-cluster data (section_id, role, prose_state,
+      target_words, claim_count, audit_flag_count, blocks_readiness,
+      has_unrenderable_marker, evidence_summary)
+    - ``claims``: per-claim data (type, role, importance, mechanism,
+      scope_conditions, evidence_status, evidence_quality, evidence,
+      cluster_id, dirty_since_last_render, has_unrenderable_marker)
+    - ``relationships``: edges (source, target, type, strength, note)
     """
-    nodes: list[dict] = []
-    edges: list[dict] = []
-    sections_legend: list[dict] = []
+    palette = section_palette or _SECTION_PALETTE
+    audit_counts = audit_flags_by_cluster or {}
+    blocking = readiness_blocking_clusters or set()
+    cluster_list = clusters or []
 
-    # Map section_id -> color for claim coloring + legend.
-    # Subsections inherit their top-level ancestor's colour so all of
-    # ``s.c``'s claims (including those in ``s.c.1``, ``s.c.1.2``)
-    # paint as one family — keeps the graph readable when a paper has
-    # three levels of nesting.
+    # Section colour mapping — top-level sections get a palette colour;
+    # subsections inherit from their top-level ancestor.
+    by_section_id = {s.section_id: s for s in graph.sections}
     renderable_sections = [
-        s for s in graph.sections
-        if s.role != SectionRole.references and s.section_id != "s.thesis"
+        s for s in graph.sections if s.role != SectionRole.references
     ]
-    top_level = [s for s in renderable_sections if not s.parent]
+    top_level = [s for s in renderable_sections if not s.parent and s.section_id != "s.thesis"]
     top_colors = {
-        s.section_id: _SECTION_PALETTE[i % len(_SECTION_PALETTE)]
+        s.section_id: palette[i % len(palette)]
         for i, s in enumerate(top_level)
     }
 
-    def _top_ancestor_id(sid: str) -> str:
-        # Walk up via the parent map until we hit a section with no parent.
-        by_id = {s.section_id: s for s in graph.sections}
-        cur = by_id.get(sid)
+    def _top_ancestor(sid: str) -> str:
+        cur = by_section_id.get(sid)
         while cur is not None and cur.parent:
-            cur = by_id.get(cur.parent)
+            cur = by_section_id.get(cur.parent)
         return cur.section_id if cur else sid
 
     section_colors = {
-        s.section_id: top_colors.get(_top_ancestor_id(s.section_id), _SECTION_PALETTE[0])
+        s.section_id: top_colors.get(_top_ancestor(s.section_id), palette[0])
         for s in renderable_sections
     }
+    section_colors["s.thesis"] = "#fef3c7"
 
-    # Thesis node first (always at the top of the layout). Prefer the
-    # argued thesis (derived from the full claim list) for the displayed
-    # text; keep the heading thesis available in the detail panel.
+    # Cluster index for quick claim → cluster lookup, and per-cluster
+    # claim counts.
+    cluster_for_claim: dict[str, str] = {}
+    cluster_summaries: list[dict] = []
+    for cluster in cluster_list:
+        for entry in cluster.claim_sequence:
+            cluster_for_claim[entry.claim_id] = cluster.cluster_id
+        prose_path = (
+            (drafts_dir / f"cluster_{cluster.cluster_id}.md")
+            if drafts_dir is not None else None
+        )
+        cluster_summaries.append({
+            "id": cluster.cluster_id,
+            "section_id": cluster.section_id,
+            "role": cluster.role.value,
+            "position": cluster.position,
+            "prose_state": cluster.prose_state.value,
+            "target_words_min": cluster.target_words_min,
+            "target_words_max": cluster.target_words_max,
+            "claim_count": len(cluster.claim_sequence),
+            "audit_flag_count": int(audit_counts.get(cluster.cluster_id, 0)),
+            "blocks_readiness": cluster.cluster_id in blocking,
+            "has_unrenderable_marker": _claim_has_unrenderable_marker(prose_path),
+            "is_dirty": cluster.prose_state == ProseState.dirty,
+            "is_failed": cluster.prose_state == ProseState.failed,
+        })
+
+    # Sections payload (preserve top-down position order).
+    sections_payload: list[dict] = []
+    for s in graph.sections:
+        depth = (
+            0 if s.section_id == "s.thesis"
+            else max(0, s.section_id.count(".") - 1)
+        )
+        cluster_count = sum(
+            1 for c in cluster_list if c.section_id == s.section_id
+        )
+        sections_payload.append({
+            "id": s.section_id,
+            "title": s.title,
+            "parent": s.parent,
+            "depth": depth,
+            "role": s.role.value,
+            "color": section_colors.get(s.section_id, palette[0]),
+            "claim_count": len(s.claim_ids),
+            "cluster_count": cluster_count,
+            "is_excluded": s.role == SectionRole.references,
+        })
+
+    # Claims payload — enriched with evidence status, mechanism, scope.
+    claims_payload: list[dict] = []
+    for claim in graph.claims:
+        section = by_section_id.get(claim.section_id) if claim.section_id else None
+        is_excluded = section is not None and section.role == SectionRole.references
+        cluster_id = cluster_for_claim.get(claim.claim_id)
+        has_unrenderable = False
+        if cluster_id and drafts_dir is not None:
+            has_unrenderable = _claim_has_unrenderable_marker(
+                drafts_dir / f"cluster_{cluster_id}.md"
+            )
+        # Role tag is stored as `role:<value>` in claim.tags.
+        role_value = next(
+            (t.split(":", 1)[1] for t in claim.tags if t.startswith("role:")),
+            "",
+        )
+        evidence_summary = [
+            {
+                "source": ev.source,
+                "binding": ev.binding_strength.value,
+                "page": ev.page,
+            }
+            for ev in claim.evidence
+        ]
+        claims_payload.append({
+            "id": claim.claim_id,
+            "statement": claim.statement,
+            "type": claim.type.value,
+            "confidence": claim.confidence.value,
+            "author_origin": claim.author_origin,
+            "section_id": claim.section_id,
+            "cluster_id": cluster_id,
+            "role": role_value,
+            "importance": float(claim.importance),
+            "mechanism": claim.mechanism,
+            "scope_conditions": list(claim.scope_conditions),
+            "evidence_status": (
+                claim.evidence_status.value if claim.evidence_status else None
+            ),
+            "evidence_quality": _evidence_quality(claim),
+            "evidence": evidence_summary,
+            "color": section_colors.get(claim.section_id or "", palette[0]),
+            "tags": list(claim.tags),
+            "is_excluded": is_excluded,
+            "has_unrenderable_marker": has_unrenderable,
+        })
+
+    # Relationship edges — drop edges whose endpoints are in excluded
+    # sections (they wouldn't render anyway).
+    excluded_claim_ids = {
+        c["id"] for c in claims_payload if c["is_excluded"]
+    }
+    relationships_payload: list[dict] = []
+    for rel in graph.relationships:
+        if rel.from_claim in excluded_claim_ids or rel.to_claim in excluded_claim_ids:
+            continue
+        relationships_payload.append({
+            "id": rel.rel_id,
+            "source": rel.from_claim,
+            "target": rel.to_claim,
+            "type": rel.type.value,
+            "strength": rel.strength.value,
+            "note": rel.note or "",
+            "created_by": rel.created_by,
+        })
+
+    return {
+        "meta": {
+            "project_name": graph.project_name,
+            "thesis_statement": graph.thesis_statement,
+            "thesis_argued": graph.thesis_argued,
+            "section_count": len(sections_payload),
+            "cluster_count": len(cluster_summaries),
+            "claim_count": len(claims_payload),
+            "relationship_count": len(relationships_payload),
+        },
+        "sections": sections_payload,
+        "clusters": cluster_summaries,
+        "claims": claims_payload,
+        "relationships": relationships_payload,
+    }
+
+
+def render_html(
+    graph: AuthorGraph,
+    clusters: list[Cluster] | None = None,
+    *,
+    drafts_dir: Path | None = None,
+    audit_flags_by_cluster: dict[str, int] | None = None,
+    readiness_blocking_clusters: set[str] | None = None,
+) -> str:
+    """Self-contained HTML page with cytoscape.js loading the graph as JSON.
+
+    When ``clusters`` is provided, the diagram includes cluster compound
+    nodes and the filter sidebar shows cluster-state filters. When
+    ``audit_flags_by_cluster`` / ``readiness_blocking_clusters`` are
+    provided, claims inside flagged or blocked clusters get badges.
+
+    For backwards compatibility, all the new arguments are optional —
+    callers that pass only ``graph`` get the original flat-node diagram
+    (with the enriched per-claim data still attached).
+    """
+    enriched = build_visualisation_payload(
+        graph,
+        clusters=clusters,
+        drafts_dir=drafts_dir,
+        audit_flags_by_cluster=audit_flags_by_cluster,
+        readiness_blocking_clusters=readiness_blocking_clusters,
+    )
+
+    # Build the cytoscape elements (nodes + edges) from the enriched
+    # payload. We also emit section + cluster *compound* nodes when
+    # clusters are available — the JS layer toggles them on demand.
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    section_lookup = {s["id"]: s for s in enriched["sections"]}
+    cluster_lookup = {c["id"]: c for c in enriched["clusters"]}
+
+    def _include_section(s: dict) -> bool:
+        return not s["is_excluded"] and s["id"] != "s.thesis"
+
+    # Thesis node first.
     argued = (graph.thesis_argued or "").strip()
     heading = (graph.thesis_statement or "").strip()
-    if argued or heading or any(c.claim_id == "cl.thesis" for c in graph.claims):
+    if argued or heading or any(c["id"] == "cl.thesis" for c in enriched["claims"]):
         primary = argued or heading or ""
         full = primary
         if argued and heading and argued != heading:
@@ -328,62 +547,113 @@ def render_html(graph: AuthorGraph) -> str:
             }
         })
 
-    for section in renderable_sections:
-        # Section depth is encoded in the section_id (``s.c`` = 0,
-        # ``s.c.1`` = 1, ``s.c.1.2`` = 2). The legend uses depth to
-        # indent subsection entries so the reader can see the nesting.
-        depth = (
-            0 if section.section_id == "s.thesis"
-            else max(0, section.section_id.count(".") - 1)
-        )
-        sections_legend.append({
-            "id": section.section_id,
-            "parent": section.parent,
-            "title": section.title,
-            "color": section_colors[section.section_id],
-            "claimCount": len(section.claim_ids),
-            "depth": depth,
-        })
-        for cid in section.claim_ids:
-            claim = next((c for c in graph.claims if c.claim_id == cid), None)
-            if claim is None:
+    # Section + cluster compound nodes (only when clusters were passed).
+    if clusters:
+        for s in enriched["sections"]:
+            if not _include_section(s):
                 continue
             nodes.append({
                 "data": {
-                    "id": claim.claim_id,
-                    "label": _short(claim.statement, 50),
-                    "fullText": claim.statement,
-                    "type": claim.type.value,
-                    "role": next(
-                        (t.split(":", 1)[1] for t in claim.tags if t.startswith("role:")),
-                        "",
-                    ),
-                    "evidence": [ev.source for ev in claim.evidence if ev.source],
-                    "sectionId": section.section_id,
-                    "sectionTitle": section.title,
-                    "color": section_colors[section.section_id],
-                    "importance": float(claim.importance),
+                    "id": s["id"],
+                    "label": s["title"],
+                    "color": s["color"],
+                    "type": "section",
+                    "depth": s["depth"],
+                    "claimCount": s["claim_count"],
+                    "clusterCount": s["cluster_count"],
+                }
+            })
+        for c in enriched["clusters"]:
+            section = section_lookup.get(c["section_id"])
+            if section and not _include_section(section):
+                continue
+            nodes.append({
+                "data": {
+                    "id": c["id"],
+                    "parent": c["section_id"],
+                    "label": f"{c['role']} ({c['claim_count']})",
+                    "type": "cluster",
+                    "color": (section or {}).get("color", _SECTION_PALETTE[0]),
+                    "proseState": c["prose_state"],
+                    "auditFlagCount": c["audit_flag_count"],
+                    "blocksReadiness": c["blocks_readiness"],
+                    "hasUnrenderableMarker": c["has_unrenderable_marker"],
+                    "isDirty": c["is_dirty"],
+                    "isFailed": c["is_failed"],
+                    "targetWordsMin": c["target_words_min"],
+                    "targetWordsMax": c["target_words_max"],
                 }
             })
 
+    # Claim nodes — non-thesis, non-excluded.
+    for claim in enriched["claims"]:
+        if claim["is_excluded"] or claim["id"] == "cl.thesis":
+            continue
+        section = section_lookup.get(claim["section_id"]) if claim["section_id"] else None
+        section_title = section["title"] if section else ""
+        # Parent is the cluster (so cluster compound nodes group claims)
+        # when clusters are present, else the section, else nothing.
+        parent_id: str | None = None
+        if claim["cluster_id"] and claim["cluster_id"] in cluster_lookup:
+            parent_id = claim["cluster_id"]
+        elif clusters and claim["section_id"] and section and _include_section(section):
+            parent_id = claim["section_id"]
+        node_data = {
+            "id": claim["id"],
+            "label": _short(claim["statement"], 50),
+            "fullText": claim["statement"],
+            "type": claim["type"],
+            "role": claim["role"],
+            "evidence": [ev["source"] for ev in claim["evidence"] if ev["source"]],
+            "evidenceQuality": claim["evidence_quality"],
+            "evidenceStatus": claim["evidence_status"],
+            "sectionId": claim["section_id"],
+            "sectionTitle": section_title,
+            "clusterId": claim["cluster_id"],
+            "color": claim["color"],
+            "importance": claim["importance"],
+            "mechanism": claim["mechanism"],
+            "scopeConditions": claim["scope_conditions"],
+            "hasUnrenderableMarker": claim["has_unrenderable_marker"],
+        }
+        if parent_id:
+            node_data["parent"] = parent_id
+        nodes.append({"data": node_data})
+
     valid_node_ids = {n["data"]["id"] for n in nodes}
-    for rel in graph.relationships:
-        if rel.from_claim not in valid_node_ids or rel.to_claim not in valid_node_ids:
-            continue  # skip edges to nodes we excluded (e.g. into references)
+    for rel in enriched["relationships"]:
+        if rel["source"] not in valid_node_ids or rel["target"] not in valid_node_ids:
+            continue
         edges.append({
             "data": {
-                "id": rel.rel_id,
-                "source": rel.from_claim,
-                "target": rel.to_claim,
-                "label": rel.type.value,
-                "type": rel.type.value,
+                "id": rel["id"],
+                "source": rel["source"],
+                "target": rel["target"],
+                "label": rel["type"],
+                "type": rel["type"],
+                "strength": rel["strength"],
+                "note": rel["note"],
             }
         })
 
     payload = json.dumps({
         "nodes": nodes,
         "edges": edges,
-        "sections": sections_legend,
+        "sections": [
+            {
+                "id": s["id"],
+                "parent": s["parent"],
+                "title": s["title"],
+                "color": s["color"],
+                "claimCount": s["claim_count"],
+                "clusterCount": s["cluster_count"],
+                "depth": s["depth"],
+            }
+            for s in enriched["sections"]
+            if _include_section(s)
+        ],
+        "clusters": enriched["clusters"],
+        "meta": enriched["meta"],
     })
     project_title = html.escape(graph.project_name or "Argument graph")
 
@@ -519,6 +789,20 @@ _HTML_TEMPLATE = """<!doctype html>
   details summary {
     cursor: pointer; font-size: 11px; color: var(--accent); user-select: none;
   }
+  .filter-row {
+    display: flex; align-items: center; gap: 6px; padding: 4px 6px;
+    cursor: pointer; font-size: 12px; color: #374151;
+  }
+  .filter-row input { cursor: pointer; }
+  .filter-row:hover { background: rgba(59, 130, 246, 0.06); border-radius: 4px; }
+  .badge {
+    display: inline-block; font-size: 10px; padding: 1px 5px;
+    border-radius: 99px; margin-left: 4px; font-weight: 600;
+  }
+  .badge-warn   { background: #fef3c7; color: #92400e; }
+  .badge-error  { background: #fee2e2; color: #991b1b; }
+  .badge-info   { background: #dbeafe; color: #1e40af; }
+  .badge-muted  { background: #f3f4f6; color: #6b7280; }
 </style>
 </head>
 <body>
@@ -556,6 +840,16 @@ _HTML_TEMPLATE = """<!doctype html>
     <div class="legend-row"><span class="legend-swatch" style="background:#fef3c7;border-color:#f59e0b;border-width:2px;"></span><span>Thesis</span></div>
     <div class="legend-row"><span class="legend-swatch" style="background:#fff;border-color:#9ca3af;"></span><span>Empirical</span></div>
     <div class="legend-row"><span class="legend-swatch" style="background:#fff;border-color:#3b82f6;border-radius:50%;"></span><span>User synthesis (round)</span></div>
+    <h4>Filters</h4>
+    <div id="filter-rows">
+      <label class="filter-row"><input type="checkbox" data-filter="unsupported"> only unsupported claims</label>
+      <label class="filter-row"><input type="checkbox" data-filter="synthesis"> only user_synthesis claims</label>
+      <label class="filter-row"><input type="checkbox" data-filter="weak_evidence"> only weak / source-hint evidence</label>
+      <label class="filter-row"><input type="checkbox" data-filter="dirty_clusters"> only claims in dirty / failed clusters</label>
+      <label class="filter-row"><input type="checkbox" data-filter="touched_since_render"> only claims touched since last render</label>
+    </div>
+    <h4>Edge type filter</h4>
+    <div id="edge-filter"></div>
   </div>
 </div>
 <script>
@@ -746,6 +1040,53 @@ const cy = cytoscape({
     }},
     { selector: 'edge.dimmed', style: { 'opacity': 0.1 }},
     { selector: 'edge.highlight', style: { 'opacity': 1, 'width': 3 }},
+
+    // ── Phase 3: compound section + cluster nodes ──
+    // Section compound: a soft tinted container so claims grouped under
+    // it are visually subordinate. Label sits at top-left; padding gives
+    // children room to breathe.
+    { selector: 'node[type = "section"]', style: {
+        'background-color': 'data(color)',
+        'background-opacity': 0.18,
+        'border-color': 'data(color)', 'border-width': 1.5,
+        'border-style': 'dashed',
+        'shape': 'round-rectangle', 'corner-radius': 12,
+        'label': 'data(label)', 'text-valign': 'top', 'text-halign': 'left',
+        'font-weight': 600, 'font-size': 11, 'color': '#374151',
+        'padding': 18,
+        'compound-sizing-wrt-labels': 'include',
+    }},
+    // Cluster compound: tighter container inside the section. Border
+    // colour reflects render state — dirty/failed clusters get a warning
+    // border so the diagram immediately signals what's stale.
+    { selector: 'node[type = "cluster"]', style: {
+        'background-color': '#fff', 'background-opacity': 0.45,
+        'border-color': '#cbd5e1', 'border-width': 1,
+        'shape': 'round-rectangle', 'corner-radius': 8,
+        'label': 'data(label)', 'text-valign': 'top', 'text-halign': 'left',
+        'font-size': 10, 'color': '#6b7280', 'font-weight': 500,
+        'padding': 10,
+    }},
+    { selector: 'node[type = "cluster"][?isDirty]', style: {
+        'border-color': '#f59e0b', 'border-width': 2, 'border-style': 'dashed',
+    }},
+    { selector: 'node[type = "cluster"][?isFailed]', style: {
+        'border-color': '#dc2626', 'border-width': 2.5,
+    }},
+    { selector: 'node[type = "cluster"][?blocksReadiness]', style: {
+        'border-color': '#dc2626', 'border-width': 2,
+    }},
+    { selector: 'node[type = "cluster"][?hasUnrenderableMarker]', style: {
+        'border-color': '#dc2626', 'border-width': 2.5, 'border-style': 'double',
+    }},
+    // Claim border tint by evidence quality — weak/unbound claims look
+    // visibly different from bound or contradictory ones.
+    { selector: 'node[evidenceQuality = "unbound"]', style: { 'border-color': '#fbbf24' }},
+    { selector: 'node[evidenceQuality = "source_hint"]', style: { 'border-color': '#fbbf24' }},
+    { selector: 'node[evidenceQuality = "contradictory"]', style: { 'border-color': '#dc2626' }},
+    // Hidden state used by the filter sidebar.
+    { selector: 'node.hidden', style: { 'display': 'none' }},
+    { selector: 'edge.hidden', style: { 'display': 'none' }},
   ],
   wheelSensitivity: 0.2,
   layout: { name: 'preset' }, // we'll trigger the real layout on init
@@ -820,13 +1161,42 @@ const info = document.getElementById('info');
 cy.on('tap', 'node', evt => {
   const d = evt.target.data();
   info.classList.remove('empty');
+  // Cluster compound node: show plan/state info, not claim text.
+  if (d.type === 'cluster') {
+    let h = `<h3>${escapeHtml(d.label)}</h3>`;
+    const badges = [];
+    if (d.isFailed) badges.push(`<span class="badge badge-error">failed</span>`);
+    if (d.isDirty) badges.push(`<span class="badge badge-warn">dirty</span>`);
+    if (d.blocksReadiness) badges.push(`<span class="badge badge-error">blocks readiness</span>`);
+    if (d.hasUnrenderableMarker) badges.push(`<span class="badge badge-error">unrenderable</span>`);
+    if (d.auditFlagCount) badges.push(`<span class="badge badge-warn">${d.auditFlagCount} flag(s)</span>`);
+    h += `<div class="meta">cluster · ${escapeHtml(d.proseState)} · target ${d.targetWordsMin}-${d.targetWordsMax} words ${badges.join(' ')}</div>`;
+    info.innerHTML = h;
+    return;
+  }
+  if (d.type === 'section') {
+    let h = `<h3>${escapeHtml(d.label)}</h3>`;
+    h += `<div class="meta">section · depth ${d.depth} · ${d.claimCount} claim(s) · ${d.clusterCount} cluster(s)</div>`;
+    info.innerHTML = h;
+    return;
+  }
   let h = `<h3>${escapeHtml(d.label)}</h3>`;
+  const badges = [];
+  if (d.evidenceQuality === 'unbound') badges.push(`<span class="badge badge-warn">unbound</span>`);
+  if (d.evidenceQuality === 'source_hint') badges.push(`<span class="badge badge-info">source hint</span>`);
+  if (d.evidenceQuality === 'contradictory') badges.push(`<span class="badge badge-error">contradictory</span>`);
+  if (d.hasUnrenderableMarker) badges.push(`<span class="badge badge-error">unrenderable</span>`);
+  if (d.evidenceStatus) badges.push(`<span class="badge badge-muted">${escapeHtml(d.evidenceStatus)}</span>`);
   h += `<div class="meta">${escapeHtml(d.sectionTitle || '')} · ${d.type}${d.role ? ' · ' + d.role : ''}`;
   if (typeof d.importance === 'number') {
     h += ` · importance ${d.importance.toFixed(2)}`;
   }
-  h += `</div>`;
+  h += ` ${badges.join(' ')}</div>`;
   if (d.fullText && d.fullText !== d.label) h += `<p>${escapeHtml(d.fullText)}</p>`;
+  if (d.mechanism) h += `<p class="meta"><strong>mechanism:</strong> ${escapeHtml(d.mechanism)}</p>`;
+  if (d.scopeConditions && d.scopeConditions.length) {
+    h += `<p class="meta"><strong>scope:</strong> ${d.scopeConditions.map(escapeHtml).join('; ')}</p>`;
+  }
   if (d.evidence && d.evidence.length) h += `<p class="meta">refs: ${d.evidence.map(escapeHtml).join(', ')}</p>`;
   info.innerHTML = h;
 });
@@ -848,6 +1218,98 @@ cy.on('tap', evt => {
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+
+// ── Phase 3: claim-state filters ──
+// Each checkbox in #filter-rows narrows the visible set to claims
+// matching its predicate. Multiple boxes AND together. Cluster compound
+// nodes follow their children: if all children are hidden, the parent
+// is hidden too.
+const filterPredicates = {
+  unsupported: n => {
+    const t = n.data('type');
+    if (t !== 'empirical' && t !== 'methodological' && t !== 'normative' && t !== 'definition') return false;
+    const eq = n.data('evidenceQuality');
+    return eq === 'unbound' || eq === 'source_hint' || eq === 'contradictory';
+  },
+  synthesis: n => n.data('type') === 'user_synthesis',
+  weak_evidence: n => {
+    const eq = n.data('evidenceQuality');
+    return eq === 'unbound' || eq === 'source_hint' || eq === 'contradictory';
+  },
+  dirty_clusters: n => {
+    const cid = n.data('clusterId');
+    if (!cid) return false;
+    const cluster = (data.clusters || []).find(c => c.id === cid);
+    return cluster && (cluster.is_dirty || cluster.is_failed || cluster.blocks_readiness);
+  },
+  // "Touched since render" — claims whose owning cluster is dirty.
+  // Same predicate as dirty_clusters until we surface per-claim
+  // modified_at vs cluster.last_rendered_at (deferred — needs payload extension).
+  touched_since_render: n => {
+    const cid = n.data('clusterId');
+    if (!cid) return false;
+    const cluster = (data.clusters || []).find(c => c.id === cid);
+    return cluster && cluster.is_dirty;
+  },
+};
+
+const enabledFilters = new Set();
+
+function applyFilters() {
+  cy.batch(() => {
+    cy.elements().removeClass('hidden');
+    if (enabledFilters.size === 0 && enabledEdgeTypes.size === 0) return;
+
+    cy.nodes().forEach(n => {
+      // Compound nodes (sections / clusters) follow their children.
+      if (n.data('type') === 'section' || n.data('type') === 'cluster') return;
+      const matches = [...enabledFilters].every(f => filterPredicates[f](n));
+      if (!matches) n.addClass('hidden');
+    });
+    // Hide edges where either endpoint is hidden.
+    cy.edges().forEach(e => {
+      if (enabledEdgeTypes.size > 0 && !enabledEdgeTypes.has(e.data('type'))) {
+        e.addClass('hidden');
+        return;
+      }
+      const sHidden = e.source().hasClass('hidden');
+      const tHidden = e.target().hasClass('hidden');
+      if (sHidden || tHidden) e.addClass('hidden');
+    });
+    // Hide compound parents whose children are all hidden.
+    cy.nodes('[type = "cluster"], [type = "section"]').forEach(parent => {
+      const visibleChildren = parent.children().filter(c => !c.hasClass('hidden'));
+      if (parent.children().length > 0 && visibleChildren.length === 0) {
+        parent.addClass('hidden');
+      }
+    });
+  });
+}
+
+document.querySelectorAll('#filter-rows input[type="checkbox"]').forEach(box => {
+  box.addEventListener('change', () => {
+    const f = box.dataset.filter;
+    if (box.checked) enabledFilters.add(f); else enabledFilters.delete(f);
+    applyFilters();
+  });
+});
+
+// Edge-type filter: per-type checkboxes derived from the data so we
+// only show types the document actually uses.
+const enabledEdgeTypes = new Set();  // empty = all visible
+const edgeTypesPresent = new Set(data.edges.map(e => e.data.type));
+const edgeFilterEl = document.getElementById('edge-filter');
+[...edgeTypesPresent].sort().forEach(t => {
+  const row = document.createElement('label');
+  row.className = 'filter-row';
+  row.innerHTML = `<input type="checkbox" data-edge-type="${escapeHtml(t)}"> ${escapeHtml(t)}`;
+  edgeFilterEl.appendChild(row);
+  row.querySelector('input').addEventListener('change', evt => {
+    const v = evt.target.dataset.edgeType;
+    if (evt.target.checked) enabledEdgeTypes.add(v); else enabledEdgeTypes.delete(v);
+    applyFilters();
+  });
+});
 </script>
 </body>
 </html>

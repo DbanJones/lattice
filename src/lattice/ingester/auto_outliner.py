@@ -8,16 +8,35 @@ This module bridges that gap: ``structure_outline`` takes raw prose and
 returns a lattice-format markdown outline by asking Claude to extract
 the thesis, sections, and per-section claims.
 
-The output is intentionally conservative: only structure that the
-ingester can parse, no inline citation tagging. Users can always edit
-the result before re-running.
+The output now includes richer per-claim metadata (claim type, role,
+mechanism, citation hints, source-span excerpts) so downstream stages
+have something to work with before the enricher runs. The markdown is
+still the editable artifact — Claude emits the richer tags using the
+vocabulary the markdown ingester already parses, so there is one source
+of truth.
+
+``structure_outline`` keeps its old return type (markdown string) for
+callers that don't care about diagnostics; ``structure_outline_with_report``
+returns the same markdown plus an ``AutoOutlinerReport`` summarising
+what was extracted and any tag-shape issues spotted in the response.
 """
 
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
+
+from ..graph.models import (
+    AutoOutlinerSummary,
+    ScaffoldWarning,
+    ScaffoldWarningLevel,
+)
+
+# Re-export the model under its old name so external callers that
+# imported ``AutoOutlinerReport`` keep working.
+AutoOutlinerReport = AutoOutlinerSummary
 
 
 # Top-level (``# A.``), nested subsection (``## A.1``,
@@ -114,48 +133,59 @@ class _LLMProtocol(Protocol):
 
 _SYSTEM_PROMPT_TEMPLATE = """You are converting raw academic paper prose into a Lattice outline.
 
-Lattice outlines have a strict, parser-friendly format. Every line and tag matters because a deterministic parser reads this file:
+Lattice outlines have a strict, parser-friendly format. Every line and tag matters because a deterministic parser reads this file. Your job is to produce a richly-tagged scaffold that downstream stages can build on, not a flat summary.
+
+Example shape (see Tag vocabulary below for the full list):
 
     # THESIS
 
     [One-sentence thesis statement.]
 
-    # A. [First section heading]
+    # A. [First section heading] [role: introduction]
 
-      - [Claim 1, written as a single declarative sentence.] [user_synthesis]
-      - [Claim 2.] [user_synthesis]
-      - MY VIEW: [Author's analytical synthesis.] [user_synthesis]
+      - [Claim 1: an empirical finding from the source, declarative.] [type: empirical] [role: evidence] [evidence_status: source_hint] [ref: smith_2020] [importance: 0.7]
+      - [Claim 2: a definition the paper sets up.] [type: definition] [role: setup] [evidence_status: unbound]
+      - MY VIEW: [Author's analytical synthesis tying the section back to the thesis.] [type: user_synthesis] [importance: 0.9] [supports: thesis]
 
     ## A.1 [Subsection heading, only if the section has multiple distinct themes]
 
-      - [Sub-claim 1.] [user_synthesis]
-      - [Sub-claim 2.] [user_synthesis]
+      - [Sub-claim with a known mechanism.] [type: empirical] [mechanism: increased throughput drives Wright's-law cost decline] [evidence_status: source_hint] [ref: lee_2019]
 
-    ### A.1.1 [Sub-subsection, only when warranted by depth of source material]
+    # B. [Next section heading] [role: argumentative]
 
-      - [Deep claim.] [user_synthesis]
-
-    # B. [Next section heading]
-
-      - [Claim.] [user_synthesis]
+      - [Claim that qualifies a claim from section A.] [type: methodological] [qualifies: cl.a.1]
+      - COUNTER: [A claim from the literature the paper rebuts.] [type: empirical] [contradicts: thesis]
 
     # Z. Conclusion [role: conclusion]
 
-      - [Closing claim that ties the argument back to the thesis.] [user_synthesis]
+      - [Closing claim that ties the argument back to the thesis.] [type: user_synthesis] [supports: thesis]
 
 Rules you MUST follow:
 1. Always begin with `# THESIS` followed by a blank line and exactly one sentence.
-2. Top-level sections use `# A.`, `# B.`, `# C.`, ... — the letter MUST be followed by a period and a space.
+2. Top-level sections use `# A.`, `# B.`, `# C.`, ... — the letter MUST be followed by a period and a space. Add `[role: introduction|argumentative|evidence_synthesis|methodological|counterargument|conclusion]` when it's clear from the section's purpose.
 3. **{NESTING_RULE}**
-4. Each claim is a `  - ` bullet (two spaces, a dash, a space) followed by the claim sentence and at least one tag in square brackets.
-5. **Tag EVERY claim with `[user_synthesis]`.** This signals that the claim is the author's own restating of the argument, which makes the claim renderable without external evidence bindings. Other tags (`[strong]`, `[empirical]`, etc.) require evidence bindings the project may not have.
-6. **The final section MUST be `# Z. Conclusion [role: conclusion]`** (use the next available letter and the literal tag `[role: conclusion]` — note the COLON, not equals). Lattice's voice template requires a closing section.
-7. **Be thorough — extract every distinct claim the paper makes**, not just a high-level summary. A typical 10-30 page paper produces 40-100+ claims across its sections. Don't compress aggressively; the author can prune later.
-8. Let the source's structure dictate the breadth: papers with 8-10 distinct argumentative moves should produce 8-10 sections. Don't artificially cap section count.
-9. Do NOT invent claims that aren't in the source. Stay faithful to what the source argues.
-10. Do NOT include source citations, references lists, figure captions, or author affiliations — only the argumentative spine.
-11. Section headings should be short (3-7 words).
-12. Output ONLY the markdown. No preamble, no explanation, no code fences.
+4. Each claim is a `  - ` bullet (two spaces, a dash, a space) followed by the claim sentence and one or more tags in square brackets.
+5. **Tag every claim with `[type: ...]`** picking the value that fits: `empirical` (a fact the source asserts), `methodological` (a statement about method/measurement), `normative` (a value judgement), `definition` (terminological scaffolding), `user_synthesis` (the author's own restating). When in doubt between empirical and user_synthesis, prefer `empirical` if the source provides supporting data, `user_synthesis` only when the claim is the author's own analytical move.
+6. **For every non-`user_synthesis` claim, declare its evidence state** with one of:
+   - `[evidence_status: source_hint]` — you can identify a citation in the source text but the project may not have the corresponding paper indexed yet. Pair with `[ref: <citekey>]` using a stable lowercase slug (e.g. `[ref: koomey_2015]`).
+   - `[evidence_status: unbound]` — the claim is in the source but you cannot pin down a specific citation.
+   - Omit `evidence_status` if the claim is `[type: user_synthesis]`.
+7. **Use `[mechanism: <causal middle link>]`** for analytical/empirical claims that have a clear "X happens *because* Y" structure. Capture the mechanism in the author's own terms — short, declarative, no hedging.
+8. **Use `[role: setup|evidence|mechanism|narrative|limit|complication|counterargument|synthesis|conclusion]`** to describe the role the claim plays inside its section. This drives later cluster planning.
+9. **Use `[importance: 0.X]`** (a float in [0, 1]) for the claim's weight in the document's overall argument. Default to 0.5 when uncertain. Reserve 0.9+ for thesis-bearing claims and ≤0.3 for asides.
+10. **Use relationship tags to wire claims together** when the source makes the link explicit:
+    - `[supports: cl.<id>]`, `[contradicts: cl.<id>]`, `[qualifies: cl.<id>]`, `[extends: cl.<id>]`, `[depends_on: cl.<id>]`, `[pivot: cl.<id>]` (for an interpretive pivot — a sharp two-move analytical structure that reframes how the target should be read).
+    - Use `[supports: thesis]` / `[contradicts: thesis]` when the link is to the central thesis. Prefix `MY VIEW:` already implies `[supports: thesis]`; prefix `COUNTER:` already implies `[contradicts: thesis]`.
+    - You can reference a claim that appears *later* in the outline — the parser resolves targets after the full file is read.
+11. **Use `[source_excerpt: "verbatim quote"]`** when the claim is paraphrased from a specific quotable span in the source. Keep excerpts under 200 characters and faithful to the original wording.
+12. **Use `[scope: condition]`** for empirical claims with explicit scope conditions (population, time period, measurement regime).
+13. **The final section MUST be `# Z. Conclusion [role: conclusion]`** (use the next available letter and the literal tag `[role: conclusion]` — note the COLON, not equals).
+14. **Be thorough — extract every distinct claim the paper makes**, not just a high-level summary. A typical 10-30 page paper produces 40-100+ claims across its sections. Don't compress aggressively; the author can prune later.
+15. Let the source's structure dictate the breadth: papers with 8-10 distinct argumentative moves should produce 8-10 sections. Don't artificially cap section count.
+16. Do NOT invent claims that aren't in the source. Stay faithful to what the source argues. Where you cannot identify a citation but the claim is empirical, mark it `[evidence_status: unbound]` rather than upgrading it to `user_synthesis`.
+17. Do NOT include source citations, references lists, figure captions, or author affiliations as claims — only the argumentative spine.
+18. Section headings should be short (3-7 words).
+19. Output ONLY the markdown. No preamble, no explanation, no code fences.
 """
 
 
@@ -213,21 +243,124 @@ def _user_prompt(prose: str) -> str:
     )
 
 
-async def structure_outline(
-    prose: str,
-    llm: _LLMProtocol,
-    max_depth: int = 2,
-) -> str:
-    """Ask Claude to convert raw paper prose into a lattice outline.
+# Tag families the report inspects. Keep in sync with the markdown
+# ingester — we only count tags the parser actually understands.
+_TYPE_VALUES = {"empirical", "methodological", "normative", "user_synthesis", "definition"}
+_RELATIONSHIP_TAG_NAMES = {
+    "supports", "contradicts", "qualifies", "extends",
+    "depends_on", "pivot", "interpretive_pivot",
+}
+_TAG_INSPECT_RE = re.compile(r"\[([^\]]+)\]")
 
-    ``max_depth`` controls how deep the section tree is allowed to go:
-      1 = flat, ``# A.`` only
-      2 = subsections, ``# A.`` + ``## A.1`` (default)
-      3 = sub-sub, also allows ``### A.1.1``
 
-    Returns the structured markdown. Raises ``RuntimeError`` if the
-    model output doesn't look like a lattice outline (defensive — we'd
-    rather fail loudly than save garbage to disk)."""
+def _summarise_outline(
+    structured: str, max_depth: int, raw_response: str
+) -> AutoOutlinerSummary:
+    """Walk the structured markdown and produce a summary of how rich
+    the extraction was. Pure inspection — no parsing of claim semantics
+    beyond counting tags by family."""
+    report = AutoOutlinerSummary(
+        generated_at=datetime.now(timezone.utc),
+        max_depth=max_depth,
+        raw_response_preview=raw_response[:500],
+    )
+
+    section_count = 0
+    bullet_lines = []
+    for line in structured.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#") and not stripped.startswith("# THESIS"):
+            section_count += 1
+        elif stripped.startswith("- "):
+            bullet_lines.append(stripped)
+
+    report.section_count = section_count
+    report.claim_count = len(bullet_lines)
+
+    for bullet in bullet_lines:
+        tags_in_line: dict[str, str] = {}
+        flags_in_line: set[str] = set()
+        for match in _TAG_INSPECT_RE.finditer(bullet):
+            body = match.group(1).strip()
+            sep_index = -1
+            for sep in (":", "="):
+                idx = body.find(sep)
+                if idx >= 0 and (sep_index == -1 or idx < sep_index):
+                    sep_index = idx
+            if sep_index >= 0:
+                key = body[:sep_index].strip()
+                val = body[sep_index + 1 :].strip()
+                tags_in_line[key] = val
+            else:
+                flags_in_line.add(body)
+
+        type_value = tags_in_line.get("type")
+        if type_value:
+            report.typed_claim_count += 1
+            if type_value not in _TYPE_VALUES:
+                report.warnings.append(
+                    ScaffoldWarning(
+                        level=ScaffoldWarningLevel.warning,
+                        code="auto_outliner_unknown_type",
+                        message=(
+                            f"Claude emitted [type: {type_value}], which is "
+                            "not in the accepted vocabulary. The ingester "
+                            "will fall back to its default."
+                        ),
+                        raw=bullet,
+                    )
+                )
+        if type_value == "user_synthesis" or "user_synthesis" in flags_in_line:
+            report.user_synthesis_claim_count += 1
+        if "mechanism" in tags_in_line:
+            report.mechanism_claim_count += 1
+        if "ref" in tags_in_line or tags_in_line.get("evidence_status") == "source_hint":
+            report.evidence_hint_count += 1
+        if "importance" in tags_in_line:
+            try:
+                value = float(tags_in_line["importance"])
+            except ValueError:
+                report.warnings.append(
+                    ScaffoldWarning(
+                        level=ScaffoldWarningLevel.warning,
+                        code="auto_outliner_bad_importance",
+                        message=(
+                            f"Claude emitted non-numeric "
+                            f"[importance: {tags_in_line['importance']}]"
+                        ),
+                        raw=bullet,
+                    )
+                )
+            else:
+                if 0.0 <= value <= 1.0:
+                    report.importance_set_count += 1
+        for rel_tag in _RELATIONSHIP_TAG_NAMES:
+            if rel_tag in tags_in_line:
+                report.relationship_tag_count += 1
+
+    # Quality signal: if Claude tagged < 50% of claims with [type:], the
+    # output is much closer to the legacy "everything is user_synthesis"
+    # collapse than the richer scaffold we want.
+    if report.claim_count and report.typed_claim_count / report.claim_count < 0.5:
+        report.warnings.append(
+            ScaffoldWarning(
+                level=ScaffoldWarningLevel.warning,
+                code="auto_outliner_sparse_typing",
+                message=(
+                    f"Only {report.typed_claim_count}/{report.claim_count} "
+                    "claims got an explicit [type: ...] tag. The ingest "
+                    "result will lean heavily on default empirical/user_"
+                    "synthesis inference."
+                ),
+            )
+        )
+
+    return report
+
+
+async def _call_claude(prose: str, llm: _LLMProtocol, max_depth: int) -> str:
+    """Shared LLM call + sanitisation used by both ``structure_outline``
+    and ``structure_outline_with_report``. Returns the cleaned markdown."""
     response = await llm.complete(
         system=_system_prompt(max_depth),
         user=_user_prompt(prose),
@@ -236,8 +369,6 @@ async def structure_outline(
     # Strip code fences if the model wrapped its output despite our
     # instruction.
     if structured.startswith("```"):
-        # Remove the opening fence (and optional language tag) and the
-        # trailing fence.
         lines = structured.splitlines()
         if lines:
             lines = lines[1:]
@@ -252,6 +383,41 @@ async def structure_outline(
             f"chars: {structured[:500]!r}"
         )
     return structured
+
+
+async def structure_outline(
+    prose: str,
+    llm: _LLMProtocol,
+    max_depth: int = 2,
+) -> str:
+    """Ask Claude to convert raw paper prose into a lattice outline.
+
+    ``max_depth`` controls how deep the section tree is allowed to go:
+      1 = flat, ``# A.`` only
+      2 = subsections, ``# A.`` + ``## A.1`` (default)
+      3 = sub-sub, also allows ``### A.1.1``
+
+    Returns the structured markdown. Raises ``RuntimeError`` if the
+    model output doesn't look like a lattice outline (defensive — we'd
+    rather fail loudly than save garbage to disk).
+
+    Use ``structure_outline_with_report`` if you want a summary of what
+    Claude produced (tag richness, warnings) alongside the markdown.
+    """
+    return await _call_claude(prose, llm, max_depth)
+
+
+async def structure_outline_with_report(
+    prose: str,
+    llm: _LLMProtocol,
+    max_depth: int = 2,
+) -> tuple[str, AutoOutlinerSummary]:
+    """Same as ``structure_outline`` plus an ``AutoOutlinerSummary``
+    describing how rich the extraction was. Used by activities that
+    persist a scaffold report alongside the outline."""
+    structured = await _call_claude(prose, llm, max_depth)
+    report = _summarise_outline(structured, max_depth, raw_response=structured)
+    return structured, report
 
 
 def write_structured_outline(

@@ -610,6 +610,8 @@ def _format_cluster_block(
         )
     claims_block = "\n".join(claims_xml) or "  (no claims)"
 
+    relationships_block = _format_chunk_relationship_context(cluster)
+
     return f"""<cluster id="{cluster.cluster_id}" section="{section_title}" section_role="{section_role}" role="{cluster.role.value}" target_words="{cluster.target_words_min}-{cluster.target_words_max}" state="{state}">
   <transition_in>{cluster.transition_in_hint or ''}</transition_in>
   <transition_out>{cluster.transition_out_hint or ''}</transition_out>
@@ -619,10 +621,44 @@ def _format_cluster_block(
     catalogue_forbidden: {str(cit.catalogue_forbidden).lower()}
     first_mention_full: {cit.first_mention_full or "none"}
   </citation_strategy>
+  <relationships>
+{relationships_block}
+  </relationships>
   <claims>
 {claims_block}
   </claims>
 </cluster>"""
+
+
+def _format_chunk_relationship_context(cluster) -> str:
+    """Inline cluster-level relationship payload for the chunked renderer.
+
+    Mirrors ``cluster_renderer._format_relationship_context`` but indents
+    the rows so they sit cleanly inside the per-cluster XML block."""
+    rels = getattr(cluster, "relationship_context", None) or []
+    if not rels:
+        return "    (none)"
+    intra = [r for r in rels if r.direction == "intra" and r.affects_rendering]
+    incoming = [r for r in rels if r.direction == "incoming" and r.affects_rendering]
+    outgoing = [r for r in rels if r.direction == "outgoing" and r.affects_rendering]
+
+    lines: list[str] = []
+    for label, group in (
+        ("intra (paragraph shape)", intra),
+        ("incoming (opening picks up)", incoming),
+        ("outgoing (close sets up)", outgoing),
+    ):
+        if not group:
+            continue
+        lines.append(f"    {label}:")
+        for r in group:
+            target = f" → {r.other_cluster_id}" if r.other_cluster_id else ""
+            note = f" — {r.note}" if r.note else ""
+            lines.append(
+                f"      - {r.from_claim} -[{r.type.value}]-> "
+                f"{r.to_claim}{target}{note}"
+            )
+    return "\n".join(lines) or "    (none)"
 
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
