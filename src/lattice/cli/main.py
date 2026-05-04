@@ -2699,6 +2699,155 @@ def rescaffold(
     console.print(f"  md   → {md_path}")
 
 
+@app.command(name="rescaffold-apply")
+def rescaffold_apply(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option(..., "--voice", "-v"),
+    accept_all_with_confidence_above: float | None = typer.Option(
+        None, "--accept-all-with-confidence-above",
+        help="Batch mode: accept every operation with confidence strictly "
+             "above this threshold and reject the rest, with no per-op "
+             "prompt. Typical value: 0.6.",
+    ),
+    plan: Path | None = typer.Option(
+        None, "--plan",
+        help="Path to a specific rescaffold plan JSON. Defaults to "
+             ".lattice/rescaffold_plan.json.",
+    ),
+) -> None:
+    """Apply a rescaffold plan to the outline.
+
+    Reads ``.lattice/rescaffold_plan.json`` (or the path given by
+    ``--plan``), walks the proposed operations, and rewrites
+    ``structure/outline.md`` after explicit accept/reject per
+    operation.
+
+    Two acceptance modes:
+
+    - **Interactive** (default): each operation is shown with its
+      rationale and confidence, and you accept or reject it at the
+      prompt.
+    - **Batch**: ``--accept-all-with-confidence-above 0.6`` accepts
+      every operation above the threshold without prompting, and
+      rejects the rest. Useful when you've already reviewed the plan
+      markdown and just want to apply the high-confidence moves.
+
+    Always snapshots the current outline to
+    ``structure/outline.pre-rescaffold.md`` before any mutation, so
+    you can diff or revert. Records every accept/reject in
+    ``.lattice/rescaffold_decisions.json``. ``promote_to_offcuts``
+    operations move bullets to ``structure/outline.offcuts.md``
+    rather than deleting them.
+    """
+    from ..restructure.rescaffold_apply import (
+        apply_to_project,
+        decide_batch,
+        decide_interactive,
+        load_plan,
+    )
+
+    project = _require_project(project)
+    Config.load(project)
+    voice_obj = _load_voice(project, voice)
+
+    plan_path = plan if plan is not None else project / ".lattice" / "rescaffold_plan.json"
+    if not plan_path.exists():
+        console.print(
+            f"[red]No rescaffold plan at {plan_path}.[/red]\n"
+            f"[yellow]→[/yellow] Run `lattice rescaffold {project} --voice {voice}` first."
+        )
+        raise typer.Exit(code=3)
+
+    try:
+        plan_obj = load_plan(plan_path)
+    except (ValueError, FileNotFoundError) as exc:
+        console.print(f"[red]Could not load plan: {exc}[/red]")
+        raise typer.Exit(code=3)
+
+    if not plan_obj.operations:
+        console.print(
+            "[green]Plan has no operations to apply.[/green]\n"
+            "Either the structure was already healthy, or every operation "
+            "was filtered out by --section scoping."
+        )
+        raise typer.Exit(code=0)
+
+    store = GraphStore.load(project)
+    graph = store.get_graph()
+    if not graph.claims:
+        console.print(
+            "[red]Author graph is empty. Run `lattice ingest` first.[/red]"
+        )
+        raise typer.Exit(code=3)
+
+    # Batch vs interactive.
+    if accept_all_with_confidence_above is not None:
+        threshold = float(accept_all_with_confidence_above)
+        decisions = decide_batch(plan_obj, confidence_threshold=threshold)
+        mode: str = "batch"
+        confidence_threshold: float | None = threshold
+    else:
+        threshold = 0.0
+        confidence_threshold = None
+        mode = "interactive"
+        console.print(
+            f"[cyan]Reviewing {len(plan_obj.operations)} operation(s).[/cyan] "
+            "y = accept, n = reject, q = quit (rejects remaining)."
+        )
+
+        quitting = False
+
+        def _prompt(op) -> bool:
+            nonlocal quitting
+            if quitting:
+                return False
+            console.print()
+            console.print(
+                f"[bold]{op.kind}[/bold]  ([dim]{op.op_id}, "
+                f"confidence {op.confidence:.2f}[/dim])"
+            )
+            console.print(f"  {op.rationale}")
+            answer = typer.prompt("accept? [y/N/q]", default="N", show_default=False)
+            answer = answer.strip().lower()
+            if answer in {"q", "quit"}:
+                quitting = True
+                return False
+            return answer in {"y", "yes"}
+
+        decisions = decide_interactive(plan_obj, _prompt)
+
+    accepted = sum(1 for d in decisions if d.decision == "accept")
+    rejected = sum(1 for d in decisions if d.decision == "reject")
+    console.print(
+        f"[cyan]Decisions:[/cyan] {accepted} accepted, {rejected} rejected."
+    )
+
+    # Snapshot is part of apply_to_project — even with zero accepts it
+    # writes the pre-rescaffold snapshot for a stable diff anchor.
+    result = apply_to_project(
+        project,
+        plan_obj,
+        decisions,
+        voice_name=voice_obj.name,
+        mode=mode,  # type: ignore[arg-type]
+        confidence_threshold=confidence_threshold,
+        graph=graph,
+        save_graph=store.save_graph,
+    )
+
+    console.print()
+    console.print(
+        f"[green]Applied {result.operations_applied} operation(s).[/green]"
+    )
+    console.print(f"  snapshot → {result.snapshot_path}")
+    console.print(f"  outline  → {result.outline_path}")
+    if result.offcuts_path is not None:
+        console.print(
+            f"  offcuts  → {result.offcuts_path} ({result.offcut_count} claim(s))"
+        )
+    console.print(f"  decisions → {result.decisions_path}")
+
+
 @app.command(name="source-review")
 def source_review(
     project: Path = typer.Argument(...),
