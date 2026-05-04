@@ -2467,6 +2467,157 @@ def fill_evidence(
     )
 
 
+@app.command(name="trust")
+def trust_score_cmd(
+    project: Path = typer.Argument(...),
+    voice: str = typer.Option("academic", "--voice", "-v"),
+    sort: str = typer.Option(
+        "score", "--sort",
+        help="Sort sections by 'score' (default), 'flags', or 'order'.",
+    ),
+) -> None:
+    """Per-section trust score: which sections need careful reading.
+
+    Combines four signals:
+
+    - section metric (50%): the per-section ArgumentMetrics score
+    - audit-flag density (20%): flags-per-claim within the section
+    - readiness blocks (20%): blocked clusters drop trust to 0
+    - voice review (10%): section-level fail findings nudge
+
+    Reads any audit / readiness / voice-review files already on disk;
+    skips components that haven't run. Writes a tabular report to
+    outputs/trust.<voice>.md plus a machine-readable JSON.
+    """
+    project = _require_project(project)
+    Config.load(project)
+    voice_obj = _load_voice(project, voice)
+    store = GraphStore.load(project)
+    graph = store.get_graph()
+    if not graph.claims:
+        raise _surface_lattice_error(LatticeError(
+            code="no_graph",
+            message="Author graph is empty.",
+            next_step="Run `lattice ingest <project>` first.",
+            exit_code=3,
+        ))
+
+    from ..auditor.trust_score import (
+        cluster_to_section_map,
+        compute_trust,
+        load_audit_flags,
+        load_readiness_blocks,
+        load_voice_review_section_failures,
+    )
+    from ..graph.metrics import compute_argument_metrics
+
+    metrics = compute_argument_metrics(graph)
+    flags = load_audit_flags(project, voice_obj.name)
+    blocks = load_readiness_blocks(project, voice_obj.name)
+    voice_failures = load_voice_review_section_failures(project, voice_obj.name)
+    clusters = store.list_clusters()
+    cluster_to_section = cluster_to_section_map(graph, clusters)
+
+    report = compute_trust(
+        graph, metrics,
+        audit_flags=flags,
+        readiness_blocked_clusters=blocks,
+        cluster_to_section=cluster_to_section,
+        voice_review_section_failures=voice_failures,
+    )
+
+    # Sort.
+    sections = list(report.sections)
+    if sort == "score":
+        sections.sort(key=lambda s: s.score)  # worst first
+    elif sort == "flags":
+        sections.sort(key=lambda s: -s.audit_flag_count)
+    # else: order — leave as-is (already in section position order)
+
+    # Persist the JSON.
+    json_path = project / ".lattice" / f"trust.{voice_obj.name}.json"
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    import json as _json
+    json_path.write_text(_json.dumps({
+        "document_score": report.document_score,
+        "sections": [
+            {
+                "section_id": s.section_id,
+                "section_title": s.section_title,
+                "score": s.score,
+                "metric_component": s.metric_component,
+                "audit_component": s.audit_component,
+                "readiness_component": s.readiness_component,
+                "voice_review_component": s.voice_review_component,
+                "audit_flag_count": s.audit_flag_count,
+                "readiness_blocks": s.readiness_blocks,
+                "notes": s.notes,
+            }
+            for s in sections
+        ],
+        "untrustworthy_sections": report.untrustworthy_sections,
+    }, indent=2), encoding="utf-8")
+
+    # Markdown.
+    md_path = project / "outputs" / f"trust.{voice_obj.name}.md"
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    md_lines = [
+        f"# Trust score — {project.name}",
+        "",
+        f"**Document score**: {report.document_score:.2f}",
+        "",
+        "Per-section breakdown (lower = read more carefully):",
+        "",
+        "| Section | Score | Metric | Audit | Ready | Voice | Flags | Blocks |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for s in sections:
+        md_lines.append(
+            f"| `{s.section_id}` {s.section_title[:30]} "
+            f"| {s.score:.2f} "
+            f"| {s.metric_component:.2f} "
+            f"| {s.audit_component:.2f} "
+            f"| {s.readiness_component:.2f} "
+            f"| {s.voice_review_component:.2f} "
+            f"| {s.audit_flag_count} "
+            f"| {s.readiness_blocks} |"
+        )
+    md_lines.extend(["", ""])
+    for s in sections:
+        if s.notes:
+            md_lines.append(f"### `{s.section_id}` — {s.section_title}")
+            for n in s.notes:
+                md_lines.append(f"- {n}")
+            md_lines.append("")
+    md_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+
+    # Console summary.
+    console.print(
+        f"[cyan]Trust score[/cyan] {report.document_score:.2f} "
+        f"({len(sections)} sections, "
+        f"{len(report.untrustworthy_sections)} below 0.5)"
+    )
+    table = Table(title=f"Per-section trust ({sort} order)")
+    table.add_column("section", style="cyan")
+    table.add_column("score", justify="right")
+    table.add_column("metric", justify="right")
+    table.add_column("flags", justify="right")
+    table.add_column("blocks", justify="right")
+    table.add_column("title", style="dim")
+    for s in sections[:20]:
+        table.add_row(
+            s.section_id,
+            f"{s.score:.2f}",
+            f"{s.metric_component:.2f}",
+            str(s.audit_flag_count),
+            str(s.readiness_blocks),
+            s.section_title[:40],
+        )
+    console.print(table)
+    console.print(f"  json → {json_path}")
+    console.print(f"  md   → {md_path}")
+
+
 @app.command(name="rescaffold")
 def rescaffold(
     project: Path = typer.Argument(...),
@@ -2474,6 +2625,12 @@ def rescaffold(
     threshold: float = typer.Option(
         0.5, "--threshold",
         help="Sub-scores below this trigger structural moves (default 0.5).",
+    ),
+    section: str = typer.Option(
+        "", "--section", "-s",
+        help="Scope to one section_id (e.g. 's.b'). Drops operations and "
+             "advisories that don't touch this section's claims. Includes "
+             "subsections when the parent is named.",
     ),
 ) -> None:
     """Propose a metrics-driven rescaffold of the document.
@@ -2513,13 +2670,15 @@ def rescaffold(
     clusters = store.list_clusters()
     plan = plan_rescaffold(
         graph, voice_obj, current_clusters=clusters, threshold=threshold,
+        section_id=section.strip() or None,
     )
 
-    json_path = project / ".lattice" / "rescaffold_plan.json"
+    suffix = f".{section.strip().replace('.', '_')}" if section.strip() else ""
+    json_path = project / ".lattice" / f"rescaffold_plan{suffix}.json"
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(plan.model_dump_json(indent=2), encoding="utf-8")
 
-    md_path = project / "outputs" / f"rescaffold_plan.{voice_obj.name}.md"
+    md_path = project / "outputs" / f"rescaffold_plan{suffix}.{voice_obj.name}.md"
     md_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.write_text(format_plan_markdown(plan), encoding="utf-8")
 

@@ -4062,17 +4062,24 @@ function renderSourcesTab(main, initialSubTab) {
   const panel = main.querySelector('[data-bind="sources-panel"]');
   buildTabSubnav(panel, [
     {id: "outline",    label: "Outline"},
+    {id: "heatmap",    label: "Heatmap"},
     {id: "graph",      label: "Graph"},
     {id: "files",      label: "Source files"},
     {id: "references", label: "References"},
   ], initialSubTab, {
     outline(body) {
-      // Inject a host with the bind target the existing renderer expects.
       body.innerHTML = "";
       const host = document.createElement("div");
       host.dataset.bind = "outline";
       body.appendChild(host);
       renderHierarchy(main);
+    },
+    heatmap(body) {
+      body.innerHTML = "";
+      const host = document.createElement("div");
+      host.dataset.bind = "heatmap";
+      body.appendChild(host);
+      renderSectionHeatmap(main);
     },
     graph(body) {
       body.innerHTML = "";
@@ -4096,6 +4103,119 @@ function renderSourcesTab(main, initialSubTab) {
       renderReferences(main);
     },
   });
+}
+
+
+// ─── section heat-map (Phase 3A/C) ──────────────────────────
+//
+// One row per section, coloured by trust score (red = read carefully,
+// green = healthy). Click a row to scope the rescaffold planner to
+// that section. Reads /api/projects/{name}/section-metrics; the
+// endpoint computes everything fresh, so this view always reflects
+// the current graph + any audit/readiness files that have run.
+
+async function renderSectionHeatmap(main) {
+  const projSlug = state.current;
+  const host = main.querySelector('[data-bind="heatmap"]');
+  host.innerHTML = `<div class="muted">Loading…</div>`;
+  try {
+    const data = await fetchJSON(
+      `/api/projects/${encodeURIComponent(projSlug)}/section-metrics`,
+    );
+    if (!data.sections || !data.sections.length) {
+      host.innerHTML = `<div class="empty-state">
+        <h3>No sections yet</h3>
+        <p>Run <code>lattice ingest</code> to parse an outline.</p>
+      </div>`;
+      return;
+    }
+    host.innerHTML = `
+      <div class="heatmap-wrapper">
+        <header class="heatmap-header">
+          <h3>Section heat-map</h3>
+          <p class="muted small">Trust score per section. Lower scores
+            (red) need careful reading or revision; high scores (green)
+            are well-developed. Click a section to copy a rescaffold
+            command scoped to it.</p>
+          <div class="heatmap-doc-score">
+            <strong>Document trust:</strong> ${data.document_score.toFixed(2)}
+            ${data.untrustworthy_sections.length > 0
+              ? `<span class="muted">· ${data.untrustworthy_sections.length} section(s) below 0.5</span>`
+              : ""}
+          </div>
+        </header>
+        <table class="heatmap-table">
+          <thead>
+            <tr>
+              <th>section</th>
+              <th>trust</th>
+              <th>metric</th>
+              <th>claims</th>
+              <th>flags</th>
+              <th>blocks</th>
+              <th>evidence</th>
+              <th>mechanism</th>
+              <th>thesis</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${data.sections.map(s => `
+              <tr class="heatmap-row" data-section-id="${escapeAttr(s.section_id)}">
+                <td><code>${escapeHtml(s.section_id)}</code> <span class="muted small">${escapeHtml((s.section_title || "").slice(0, 36))}</span></td>
+                <td><span class="heatmap-score" style="background:${heatColour(s.trust_score)}">${s.trust_score.toFixed(2)}</span></td>
+                <td><span class="muted small">${s.metric_score.toFixed(2)}</span></td>
+                <td>${s.claim_count}</td>
+                <td>${s.audit_flag_count > 0 ? `<span class="badge-warning">${s.audit_flag_count}</span>` : "—"}</td>
+                <td>${s.readiness_blocks > 0 ? `<span class="badge-error">${s.readiness_blocks}</span>` : "—"}</td>
+                <td><span class="muted small">${s.evidence_backing.toFixed(2)}</span></td>
+                <td><span class="muted small">${s.mechanism_coverage.toFixed(2)}</span></td>
+                <td><span class="muted small">${s.thesis_connection.toFixed(2)}</span></td>
+                <td><button class="btn-link" data-action="copy-cmd">scope rescaffold</button></td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+        <div class="heatmap-notes">
+          ${data.sections.filter(s => s.notes && s.notes.length > 0).map(s => `
+            <div class="heatmap-note-block">
+              <strong>${escapeHtml(s.section_id)}</strong>
+              <ul>
+                ${s.notes.map(n => `<li>${escapeHtml(n)}</li>`).join("")}
+              </ul>
+            </div>
+          `).join("")}
+        </div>
+      </div>`;
+    // Wire the per-row "scope rescaffold" buttons.
+    host.querySelectorAll('[data-action="copy-cmd"]').forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        const tr = e.currentTarget.closest("tr");
+        const sid = tr.dataset.sectionId;
+        const cmd = `lattice rescaffold ${projSlug} --voice academic --section ${sid}`;
+        navigator.clipboard?.writeText?.(cmd);
+        btn.textContent = "copied";
+        setTimeout(() => { btn.textContent = "scope rescaffold"; }, 1500);
+      });
+    });
+  } catch (err) {
+    host.innerHTML = `<div class="empty-state">
+      <h3>Could not load section metrics</h3>
+      <p>${escapeHtml(err.message)}</p>
+    </div>`;
+  }
+}
+
+// Map a 0..1 trust score to a heatmap colour.
+//   0.0–0.3 : red       (urgent attention)
+//   0.3–0.5 : orange    (read carefully)
+//   0.5–0.7 : yellow    (decent; could be better)
+//   0.7–1.0 : green     (healthy)
+function heatColour(score) {
+  if (score < 0.3) return "#fee2e2";
+  if (score < 0.5) return "#fed7aa";
+  if (score < 0.7) return "#fef3c7";
+  return "#d1fae5";
 }
 
 

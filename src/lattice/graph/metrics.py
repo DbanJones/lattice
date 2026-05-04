@@ -113,22 +113,286 @@ class ArgumentBreadth(BaseModel):
     observations: list[str] = Field(default_factory=list)
 
 
+class SectionMetrics(BaseModel):
+    """Per-section diagnostic. A focused subset of ``ArgumentMetrics``
+    computed over the claims that live in one section.
+
+    Some sub-scores from the document-level metrics don't make sense
+    at section scale (counter_handling assumes contradicts→thesis
+    edges; depth measures backward chains to the thesis). This model
+    drops those and adds two section-specific signals:
+
+    - **thesis_connection** — what fraction of section claims have at
+      least one transitive supporting path back to ``cl.thesis``. A
+      section that doesn't connect to the thesis is either off-topic
+      or needs explicit linking work.
+    - **relationship_density** — relationships among claims-in-section
+      divided by the section's claim count. Catches sections that read
+      as a list of independent assertions rather than an argument.
+    """
+
+    section_id: str
+    section_title: str = ""
+    parent: str | None = None
+    role: str = ""
+    # Headline counts (raw, not normalised).
+    claim_count: int = 0
+    relationship_count: int = 0   # edges with both endpoints in this section
+    source_count: int = 0
+    # Per-component scores in [0, 1].
+    avg_importance: float = 0.0
+    evidence_backing: float = 0.0
+    mechanism_coverage: float = 0.0
+    source_diversity: float = 0.0
+    relationship_density: float = 0.0
+    thesis_connection: float = 0.0
+    claim_type_diversity: float = 0.0
+    # Aggregate: weighted average of the sub-scores above.
+    score: float = 0.0
+    observations: list[str] = Field(default_factory=list)
+
+
 class ArgumentMetrics(BaseModel):
     """Combined view emitted with every scaffold report."""
 
     strength: ArgumentStrength = Field(default_factory=ArgumentStrength)
     breadth: ArgumentBreadth = Field(default_factory=ArgumentBreadth)
+    # Per-section roll-up. Lazily populated by ``compute_argument_metrics``;
+    # ``{}`` when sections weren't computed (older serialised reports).
+    per_section: dict[str, SectionMetrics] = Field(default_factory=dict)
 
 
 # ─── public entry point ──────────────────────────────
 
 
 def compute_argument_metrics(graph: AuthorGraph) -> ArgumentMetrics:
-    """Run both metric passes against ``graph`` and return the combined view."""
+    """Run both metric passes against ``graph`` and return the combined view.
+
+    Also computes per-section metrics so the diagram + UI can show a
+    section-level heat-map. The per-section pass is cheap (each is a
+    subset of the document-level computation) and makes the metrics
+    useful for revision: an academic looking at a 50-page paper can
+    see at a glance which two sections need an afternoon of work.
+    """
     return ArgumentMetrics(
         strength=compute_strength(graph),
         breadth=compute_breadth(graph),
+        per_section=compute_all_section_metrics(graph),
     )
+
+
+def compute_all_section_metrics(
+    graph: AuthorGraph,
+) -> dict[str, SectionMetrics]:
+    """Compute ``SectionMetrics`` for every body section in ``graph``.
+
+    Skips ``s.thesis`` (the thesis claim sits in its own slot; its
+    metrics are degenerate at section scale) and any section flagged
+    as references.
+    """
+    from .models import SectionRole
+
+    out: dict[str, SectionMetrics] = {}
+    for section in graph.sections:
+        if section.section_id == "s.thesis":
+            continue
+        if section.role == SectionRole.references:
+            continue
+        out[section.section_id] = compute_section_metrics(graph, section.section_id)
+    return out
+
+
+def compute_section_metrics(
+    graph: AuthorGraph, section_id: str,
+) -> SectionMetrics:
+    """Compute the section-level metric for one section.
+
+    Pure function. Filters claims to those whose ``section_id`` matches
+    (or whose claim_id is in the section's ``claim_ids`` list, for
+    robustness against orphan claims). Operates over the resulting
+    sub-graph as if it were a complete document — except for the
+    thesis-connection signal, which still walks the full graph.
+    """
+    section = next(
+        (s for s in graph.sections if s.section_id == section_id), None,
+    )
+    if section is None:
+        return SectionMetrics(section_id=section_id)
+
+    section_claim_ids: set[str] = set(section.claim_ids)
+    # Robustness: also include claims whose section_id matches, in case
+    # the claim_ids list is stale.
+    for claim in graph.claims:
+        if claim.section_id == section_id:
+            section_claim_ids.add(claim.claim_id)
+    section_claim_ids.discard("cl.thesis")
+
+    claims = [c for c in graph.claims if c.claim_id in section_claim_ids]
+    if not claims:
+        return SectionMetrics(
+            section_id=section_id,
+            section_title=section.title,
+            parent=section.parent,
+            role=section.role.value if section.role else "",
+        )
+
+    # Relationships fully inside the section.
+    in_section_relationships = [
+        r for r in graph.relationships
+        if r.from_claim in section_claim_ids and r.to_claim in section_claim_ids
+    ]
+
+    # Sources cited by section claims.
+    source_ids: set[str] = set()
+    for claim in claims:
+        for ev in claim.evidence:
+            if ev.source:
+                source_ids.add(ev.source)
+
+    # avg_importance — claims in the section, weighted by mass.
+    avg_importance = sum(c.importance for c in claims) / len(claims)
+
+    # evidence_backing — same scoring as the document-level metric,
+    # averaged across the section's claims.
+    backing_scores = [_evidence_quality_score(c) for c in claims]
+    evidence_backing = sum(backing_scores) / len(backing_scores) if backing_scores else 0.0
+
+    # mechanism_coverage — fraction of empirical / methodological claims
+    # in the section that have a non-empty mechanism field.
+    mechanism_eligible = [
+        c for c in claims
+        if c.type in (ClaimType.empirical, ClaimType.methodological)
+    ]
+    if mechanism_eligible:
+        with_mech = sum(
+            1 for c in mechanism_eligible if (c.mechanism or "").strip()
+        )
+        mechanism_coverage = with_mech / len(mechanism_eligible)
+    else:
+        mechanism_coverage = 0.0
+
+    # source_diversity — same shape as breadth's source_diversity, but
+    # over just this section. Distinct count saturates at 6 (a section
+    # rarely cites more than 6 distinct sources well).
+    distinct = len(source_ids)
+    distinct_score = min(1.0, distinct / 6)
+    source_counts: dict[str, int] = defaultdict(int)
+    for claim in claims:
+        for ev in claim.evidence:
+            if ev.source:
+                source_counts[ev.source] += 1
+    if distinct > 1:
+        total = sum(source_counts.values())
+        entropy = -sum(
+            (n / total) * math.log2(n / total) for n in source_counts.values()
+        ) if total else 0.0
+        normalised_entropy = entropy / math.log2(distinct) if distinct > 1 else 0.0
+        source_diversity = math.sqrt(distinct_score * normalised_entropy)
+    else:
+        source_diversity = 0.0
+
+    # relationship_density — edges-per-claim within the section.
+    # Saturates at 1.5 edges per claim (a typical well-developed
+    # section averages 1-2 connections per claim).
+    rel_density_raw = len(in_section_relationships) / len(claims) if claims else 0.0
+    relationship_density = min(1.0, rel_density_raw / 1.5)
+
+    # thesis_connection — fraction of section claims that have at
+    # least one transitive supporting path back to cl.thesis (using
+    # the document graph, not just the section sub-graph).
+    thesis_connection = _thesis_connection_fraction(graph, section_claim_ids)
+
+    # claim_type_diversity — distinct types present in section / 5.
+    types_present = {c.type for c in claims}
+    claim_type_diversity = len(types_present) / 5
+
+    score = round(
+        0.20 * avg_importance
+        + 0.20 * evidence_backing
+        + 0.15 * mechanism_coverage
+        + 0.15 * source_diversity
+        + 0.15 * relationship_density
+        + 0.10 * thesis_connection
+        + 0.05 * claim_type_diversity,
+        4,
+    )
+
+    metrics = SectionMetrics(
+        section_id=section_id,
+        section_title=section.title,
+        parent=section.parent,
+        role=section.role.value if section.role else "",
+        claim_count=len(claims),
+        relationship_count=len(in_section_relationships),
+        source_count=distinct,
+        avg_importance=round(avg_importance, 4),
+        evidence_backing=round(evidence_backing, 4),
+        mechanism_coverage=round(mechanism_coverage, 4),
+        source_diversity=round(source_diversity, 4),
+        relationship_density=round(relationship_density, 4),
+        thesis_connection=round(thesis_connection, 4),
+        claim_type_diversity=round(claim_type_diversity, 4),
+        score=score,
+    )
+
+    # Observations — actionable, short, prioritised.
+    if metrics.thesis_connection < 0.5:
+        metrics.observations.append(
+            f"Only {metrics.thesis_connection:.0%} of this section's "
+            "claims connect to the thesis. Either link the off-topic "
+            "claims explicitly with [supports:] tags, or move them to "
+            "another section."
+        )
+    if metrics.relationship_density < 0.3 and metrics.claim_count >= 4:
+        metrics.observations.append(
+            f"{metrics.claim_count} claims but only "
+            f"{metrics.relationship_count} intra-section edge(s). The "
+            "section reads as a list rather than an argument; add "
+            "qualifies / extends / depends_on edges."
+        )
+    if metrics.evidence_backing < 0.4:
+        metrics.observations.append(
+            f"Evidence backing {metrics.evidence_backing:.2f} — most "
+            "claims here are weakly grounded. Run lattice fill-evidence."
+        )
+    if metrics.mechanism_coverage < 0.3 and mechanism_eligible:
+        metrics.observations.append(
+            f"Only {metrics.mechanism_coverage:.0%} of empirical / "
+            "methodological claims have a [mechanism:] tag. Run "
+            "lattice fill-mechanisms."
+        )
+    if metrics.source_count == 0 and metrics.claim_count > 0:
+        metrics.observations.append(
+            "No sources cited in this section. Either add [ref:] tags "
+            "to the empirical claims or convert them to user_synthesis."
+        )
+    return metrics
+
+
+def _thesis_connection_fraction(
+    graph: AuthorGraph, claim_ids: set[str],
+) -> float:
+    """Fraction of ``claim_ids`` with a transitive supporting path
+    back to ``cl.thesis``. Uses the same edge set as the strength
+    metric so the two stay aligned."""
+    if not claim_ids or "cl.thesis" not in {c.claim_id for c in graph.claims}:
+        return 0.0
+    inbound: dict[str, list] = defaultdict(list)
+    for rel in graph.relationships:
+        inbound[rel.to_claim].append(rel)
+    seen: set[str] = {"cl.thesis"}
+    queue: deque[str] = deque(["cl.thesis"])
+    while queue:
+        node = queue.popleft()
+        for rel in inbound[node]:
+            if rel.type not in _SUPPORTING_EDGE_TYPES:
+                continue
+            if rel.from_claim in seen:
+                continue
+            seen.add(rel.from_claim)
+            queue.append(rel.from_claim)
+    connected = sum(1 for cid in claim_ids if cid in seen)
+    return connected / len(claim_ids)
 
 
 # ─── strength ────────────────────────────────────────

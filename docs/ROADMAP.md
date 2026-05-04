@@ -46,13 +46,19 @@ The tool's metrics and auditor work at document scale. Real revision
 happens at section scale. Bridge the gap.
 
 - **3A. Section-level metrics** — `compute_argument_metrics` returns
-  per-section scores; web UI shows a heat-map. ~3 days.
-- **3B. Per-section rescaffold** — `--section <id>` flag. ~1 day.
-- **3C. Trust score per section** — single 0–1 number combining voice
-  review, readiness, audit-flag density, mechanism coverage. Tells the
-  reader where to read carefully. ~3 days.
-- **3D. Section-level diffs** — three-way diff between previous render,
-  current render, accepted edits. ~2 days.
+  per-section scores. ✅ Shipped.
+- **3B. Per-section rescaffold** — `lattice rescaffold --section <id>`
+  scopes operations + advisories. ✅ Shipped.
+- **3C. Trust score per section** — `lattice trust` combines metric +
+  audit-flag density + readiness blocks + voice review failures into
+  one 0–1 number per section. ✅ Shipped.
+- **Web UI heatmap** — `Sources → Heatmap` tab renders the per-section
+  metrics + trust scores as a colour-coded table with a "scope
+  rescaffold to this section" action. ✅ Shipped.
+- **3D. Section-level diffs** (DEFERRED) — three-way diff between
+  previous render, current render, accepted edits. The cluster
+  prose-file infrastructure already exists; this is mostly UI work.
+  ~2 days.
 
 ## Phase 4 — STEM completeness (2–3 weeks)
 

@@ -109,7 +109,7 @@ Walk the source-gap report. Accepted gaps are injected per category: `mechanism`
 
 For each cluster with `prose_state: edited`, re-render from the graph and compute embedding similarity. Flag drift below threshold.
 
-### `lattice rescaffold <project> --voice <n> [--threshold 0.5]`
+### `lattice rescaffold <project> --voice <n> [--threshold 0.5] [--section <id>]`
 
 Propose a metrics-driven rescaffold of the document. Reads the current author graph, computes argument strength + breadth metrics, and for every sub-score below `--threshold` generates structural operations (split section, add stub, reorder, move-to-offcuts) and claim-level advisories (bind evidence, add mechanism, diversify sources, address counters). Predicts metric deltas if every operation were applied.
 
@@ -118,7 +118,22 @@ Pure analysis — never mutates the graph or the outline. Writes:
 - `.lattice/rescaffold_plan.json` — machine-readable plan with per-op predicted deltas + per-claim claim_size scores
 - `outputs/rescaffold_plan.<voice>.md` — human-readable scoreboard, diagnosis, operations, advisories, proposed offcuts, top-25 claim-size table
 
+`--section <id>` scopes the planner to one section's claims (and any nested subsections). Drops operations and advisories that don't touch the section. Useful when revising one section at a time. Writes `.lattice/rescaffold_plan.<section>.json` and `outputs/rescaffold_plan.<section>.<voice>.md` so scoped runs don't overwrite the document-wide plan.
+
 A separate apply step (`lattice rescaffold-apply`, not yet implemented) walks accepted operations and edits the outline after explicit confirmation.
+
+### `lattice trust <project> --voice <n> [--sort score|flags|order]`
+
+Per-section trust score: which sections need careful reading.
+
+Combines four signals into one 0–1 number per section:
+
+- **section metric (50%)** — the per-section ArgumentMetrics score (evidence backing, mechanism coverage, source diversity, relationship density, thesis connection, claim type diversity)
+- **audit-flag density (20%)** — flags-per-claim within the section
+- **readiness blocks (20%)** — blocked clusters drop the component to 0
+- **voice review (10%)** — section-level fail findings
+
+Reads any audit / readiness / voice-review files already on disk; skips components that haven't run. Writes `.lattice/trust.<voice>.json` and a tabular markdown report at `outputs/trust.<voice>.md`. The web UI's `Sources → Heatmap` tab renders the same payload as a colour-coded table.
 
 ### `lattice fill-mechanisms <project> [--voice academic] [--editor] [--dry-run] [--limit N] [--min-importance 0.5]`
 

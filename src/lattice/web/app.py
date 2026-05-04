@@ -2529,6 +2529,74 @@ def create_app(projects_root: Path | None = None) -> FastAPI:
             notes.append("Removed stale cluster_plan.json")
         return {"ok": True, "notes": notes}
 
+    @app.get("/api/projects/{name}/section-metrics")
+    async def get_section_metrics(name: str) -> dict[str, Any]:
+        """Per-section metrics + trust scores for the Sources-tab
+        heat-map. Computes fresh against the current graph + any
+        audit / readiness / voice-review files on disk.
+
+        Cheap: pure function over already-loaded state. No LLM.
+        """
+        from ..auditor.trust_score import (
+            cluster_to_section_map,
+            compute_trust,
+            load_audit_flags,
+            load_readiness_blocks,
+            load_voice_review_section_failures,
+        )
+        from ..graph.metrics import compute_argument_metrics
+
+        path = _project_path(name)
+        store = GraphStore.load(path)
+        graph = store.get_graph()
+        if not graph.claims:
+            return {"sections": [], "document_score": 0.0}
+
+        # Use the project's default voice if not specified.
+        voice_name = "academic"
+        try:
+            from ..utils.config import Config
+            cfg = Config.load(path)
+            voice_name = cfg.default_voice or "academic"
+        except Exception:  # noqa: BLE001
+            pass
+
+        metrics = compute_argument_metrics(graph)
+        flags = load_audit_flags(path, voice_name)
+        blocks = load_readiness_blocks(path, voice_name)
+        voice_failures = load_voice_review_section_failures(path, voice_name)
+        clusters = store.list_clusters()
+        report = compute_trust(
+            graph, metrics,
+            audit_flags=flags,
+            readiness_blocked_clusters=blocks,
+            cluster_to_section=cluster_to_section_map(graph, clusters),
+            voice_review_section_failures=voice_failures,
+        )
+
+        # Combine the metrics + trust per section.
+        sections_payload = []
+        for ts in report.sections:
+            sm = metrics.per_section.get(ts.section_id)
+            sections_payload.append({
+                "section_id": ts.section_id,
+                "section_title": ts.section_title,
+                "metric_score": sm.score if sm else 0.0,
+                "trust_score": ts.score,
+                "claim_count": sm.claim_count if sm else 0,
+                "audit_flag_count": ts.audit_flag_count,
+                "readiness_blocks": ts.readiness_blocks,
+                "evidence_backing": sm.evidence_backing if sm else 0.0,
+                "mechanism_coverage": sm.mechanism_coverage if sm else 0.0,
+                "thesis_connection": sm.thesis_connection if sm else 0.0,
+                "notes": ts.notes,
+            })
+        return {
+            "document_score": report.document_score,
+            "sections": sections_payload,
+            "untrustworthy_sections": report.untrustworthy_sections,
+        }
+
     @app.get("/api/projects/{name}/hierarchy")
     async def get_hierarchy(name: str) -> dict[str, Any]:
         """Structured tree of the project: thesis → sections → clusters → claims.

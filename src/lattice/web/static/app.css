@@ -3344,3 +3344,59 @@ code:not(.path-pill) {
 .badge-error   { background: #fee2e2; color: #991b1b; padding: 1px 6px; border-radius: 99px; font-weight: 600; font-size: 11px; }
 .badge-warning { background: #fef3c7; color: #92400e; padding: 1px 6px; border-radius: 99px; font-weight: 600; font-size: 11px; }
 .badge-info    { background: #dbeafe; color: #1e40af; padding: 1px 6px; border-radius: 99px; font-weight: 600; font-size: 11px; }
+
+/* ─── Section heat-map (Phase 3A/C) ───────────────── */
+
+.heatmap-wrapper { padding: 16px 22px; }
+.heatmap-header h3 { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
+.heatmap-header p { margin: 0 0 10px; max-width: 720px; }
+.heatmap-doc-score {
+  background: var(--surface, #fff);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13px;
+  margin-bottom: 14px;
+}
+.heatmap-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  margin-bottom: 16px;
+}
+.heatmap-table th,
+.heatmap-table td {
+  padding: 6px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+}
+.heatmap-table th {
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--bg, #fafafa);
+}
+.heatmap-table tr.heatmap-row:hover { background: rgba(59, 130, 246, 0.06); }
+.heatmap-score {
+  display: inline-block;
+  min-width: 44px;
+  text-align: center;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+  color: #111827;
+}
+.heatmap-notes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+}
+.heatmap-note-block {
+  background: var(--surface, #fff);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 6px;
+  padding: 10px 14px;
+  font-size: 12px;
+}
+.heatmap-note-block strong { color: var(--accent, #3b82f6); }
+.heatmap-note-block ul { margin: 6px 0 0; padding-left: 18px; }
+.heatmap-note-block li { line-height: 1.4; margin: 3px 0; }

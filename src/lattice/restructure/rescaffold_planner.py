@@ -101,6 +101,7 @@ def plan_rescaffold(
     current_clusters: list[Cluster] | None = None,
     *,
     threshold: float = _DEFAULT_THRESHOLD,
+    section_id: str | None = None,
 ) -> RescaffoldPlan:
     """Produce a metrics-driven rescaffold plan against ``graph``.
 
@@ -109,6 +110,12 @@ def plan_rescaffold(
     claims across already-rendered cluster groups unnecessarily. Pass
     ``None`` for graph-only planning (e.g. before the assembler has
     run).
+
+    ``section_id`` scopes the planner: when set, only operations and
+    advisories that touch claims in that section are emitted. The
+    diagnosis is built from the section's metrics rather than the
+    document's; the predicted-deltas reflect the section's score
+    rather than the whole document.
     """
     sizes = claim_sizes(graph)
     current_metrics = compute_argument_metrics(graph)
@@ -222,6 +229,17 @@ def plan_rescaffold(
         )
     )
 
+    # Scope to a single section if requested. We filter AFTER full
+    # planning because the planner's per-rule generators look at the
+    # whole graph; restricting the inputs would change which rules
+    # fire. Filtering the outputs lets the section view inherit
+    # global context (e.g. "your thesis isn't connected") while only
+    # surfacing actionable items in this section.
+    if section_id is not None:
+        operations, advisories, proposed_offcuts = _filter_to_section(
+            graph, section_id, operations, advisories, proposed_offcuts,
+        )
+
     return RescaffoldPlan(
         project_name=graph.project_name,
         voice_name=voice.name,
@@ -239,6 +257,73 @@ def plan_rescaffold(
         expected_breadth_delta=round(
             predicted_metrics.breadth.score - current_metrics.breadth.score, 4
         ),
+    )
+
+
+# ─── section scoping ─────────────────────────────────
+
+
+def _filter_to_section(
+    graph: AuthorGraph,
+    section_id: str,
+    operations: list[RescaffoldOperation],
+    advisories: list[RescaffoldAdvisory],
+    proposed_offcuts: list[str],
+) -> tuple[list[RescaffoldOperation], list[RescaffoldAdvisory], list[str]]:
+    """Drop operations / advisories / offcuts that don't touch the
+    target section. A claim is "in scope" if it lives in the named
+    section; an operation is in scope if it touches at least one
+    in-scope claim or one in-scope section."""
+    section_claim_ids: set[str] = set()
+    section_ids = {section_id}
+    for claim in graph.claims:
+        if claim.section_id == section_id:
+            section_claim_ids.add(claim.claim_id)
+    # Also include nested subsections (s.b.1 is in scope if section_id == s.b).
+    for s in graph.sections:
+        if s.parent == section_id:
+            section_ids.add(s.section_id)
+            for claim in graph.claims:
+                if claim.section_id == s.section_id:
+                    section_claim_ids.add(claim.claim_id)
+
+    def _op_touches_section(op: RescaffoldOperation) -> bool:
+        if op.target_claim_id and op.target_claim_id in section_claim_ids:
+            return True
+        if op.source_section_id in section_ids:
+            return True
+        if op.target_section_id in section_ids:
+            return True
+        if op.section_ids_to_merge and any(
+            sid in section_ids for sid in op.section_ids_to_merge
+        ):
+            return True
+        if op.split_groups:
+            for group in op.split_groups:
+                if any(cid in section_claim_ids for cid in group):
+                    return True
+        if op.claim_order and any(
+            cid in section_claim_ids for cid in op.claim_order
+        ):
+            return True
+        return False
+
+    def _advisory_touches_section(a: RescaffoldAdvisory) -> bool:
+        # advisories without a target_claim_id (document-wide
+        # recommendations like add_methodological_framing) propagate —
+        # they're context the section author needs to know about.
+        if a.target_claim_id is None and a.target_section_id is None:
+            return True
+        if a.target_claim_id in section_claim_ids:
+            return True
+        if a.target_section_id in section_ids:
+            return True
+        return False
+
+    return (
+        [op for op in operations if _op_touches_section(op)],
+        [a for a in advisories if _advisory_touches_section(a)],
+        [cid for cid in proposed_offcuts if cid in section_claim_ids],
     )
 
 
