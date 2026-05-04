@@ -74,26 +74,37 @@ lattice run <project> --voice academic
 
 ## Bring an existing draft into the tool
 
-You have a half-written Word document. You want to keep iterating on it under lattice's structure + audit + restyle benefits.
-
-Two paths depending on whether the draft has a clear structure already.
-
-### If the draft has headings + bullets
+You have a half-written Word document or markdown file. You want to
+keep iterating on it under lattice's structure + audit + restyle
+benefits.
 
 ```sh
-# Convert DOCX → markdown via pandoc.
-pandoc draft.docx -o structure/outline.md
-
-# Run the auto-outliner if needed (turns prose into lattice format).
-lattice ingest <project>      # if the parser sees structure, you're done
-                              # if not, the activity surface will offer the
-                              # auto-outliner option.
+lattice import draft.docx [<project>] [--references zotero.json]
 ```
 
-### If the draft is raw prose
+The wizard detects what the doc is:
 
-Use the Scaffold activity in the web UI. It detects raw prose, runs the
-auto-outliner (Claude), and produces a tagged outline you can edit.
+- **Lattice-format markdown** (already has `# THESIS` / `# A.` / `## A.1`)
+  → lands directly in `structure/outline.md`. Ready to ingest.
+- **Structured DOCX** (Heading 1 / Heading 2 / bullet styles)
+  → routed through the DOCX ingester; lands in `structure/outline.md`.
+- **Raw prose** (DOCX or markdown without lattice headings)
+  → archived to `structure/outline.raw.md`. Run the **Scaffold** activity
+  in the web UI (or `lattice annotate <project>`) to auto-structure via
+  Claude.
+
+After import, the wizard prints a tailored next-steps list. The
+typical follow-on:
+
+```sh
+lattice ingest <project>                       # parse the outline
+lattice annotate <project>                     # claim roles + types via LLM
+lattice render <project> --voice academic       # produce a draft
+```
+
+If you have a Zotero / BibTeX / RIS export, pass `--references <file>` to
+seed the source store at import time. Otherwise drop PDFs into
+`refs/papers/` and run `lattice index <project>`.
 
 ## Get a structural review of an existing draft
 

@@ -1329,6 +1329,167 @@ def _prompt_via_editor(cand) -> str:
     return " ".join(body_lines).strip()
 
 
+@app.command(name="cookbook")
+def cookbook(
+    topic: str = typer.Argument(
+        None,
+        help="Recipe slug to display (e.g. 'restyle', 'from-sources', "
+             "'import', 'rescaffold', 'shadow', 'presubmit', "
+             "'references'). Omit to list all recipes.",
+    ),
+) -> None:
+    """Show workflow recipes — the choreography behind the 36 commands.
+
+    The CLI is broad. Most users only need 5-10 commands at a time
+    depending on what they're doing. This is the curated map: pick a
+    recipe and see the exact command sequence.
+
+    See docs/WORKFLOWS.md for the full version.
+    """
+    from .cookbook import find_recipe, list_recipes
+
+    if topic:
+        recipe = find_recipe(topic)
+        if recipe is None:
+            available = ", ".join(r.slug for r in list_recipes())
+            console.print(
+                f"[yellow]No recipe named {topic!r}.[/yellow] "
+                f"Available: {available}"
+            )
+            raise typer.Exit(code=3)
+        console.print()
+        console.print(f"[bold cyan]{recipe.title}[/bold cyan]")
+        console.print(f"[dim]{recipe.summary}[/dim]")
+        console.print()
+        if recipe.when_to_use:
+            console.print(f"[bold]When:[/bold] {recipe.when_to_use}")
+            console.print()
+        if recipe.pre_conditions:
+            console.print("[bold]Pre-conditions:[/bold]")
+            for pc in recipe.pre_conditions:
+                console.print(f"  · {pc}")
+            console.print()
+        console.print("[bold]Commands:[/bold]")
+        for step in recipe.steps:
+            if step.lstrip().startswith("#"):
+                console.print(f"  [dim]{step}[/dim]")
+            else:
+                console.print(f"  [green]$[/green] {step}")
+        if recipe.next:
+            console.print()
+            console.print(f"[bold]Next:[/bold] {recipe.next}")
+        console.print()
+        console.print(
+            "[dim]See docs/WORKFLOWS.md for the full reference.[/dim]"
+        )
+        return
+
+    # No topic: list everything.
+    recipes = list_recipes()
+    table = Table(title="Workflow recipes")
+    table.add_column("slug", style="cyan")
+    table.add_column("title")
+    table.add_column("summary", style="dim")
+    for r in recipes:
+        table.add_row(r.slug, r.title, r.summary)
+    console.print(table)
+    console.print()
+    console.print(
+        "[dim]Run [/dim][cyan]lattice cookbook <slug>[/cyan][dim] for "
+        "the full sequence of commands.[/dim]"
+    )
+
+
+@app.command(name="import")
+def import_paper_cmd(
+    document: Path = typer.Argument(
+        ..., exists=True, readable=True,
+        help="Path to your draft (.md, .markdown, .txt, or .docx).",
+    ),
+    project: Path = typer.Argument(
+        None,
+        help="Project directory to create or populate. Default: a "
+             "directory named after the document, in the current dir.",
+    ),
+    voice: str = typer.Option(
+        "academic", "--voice", "-v",
+        help="Voice file to drop into voices/. Default: academic.",
+    ),
+    references: Path = typer.Option(
+        None, "--references", "-r",
+        exists=True, readable=True,
+        help="Optional Zotero CSL-JSON / BibTeX / RIS file to seed the "
+             "source store.",
+    ),
+    overwrite: bool = typer.Option(
+        False, "--overwrite",
+        help="Replace existing outline.md / outline.raw.md if present.",
+    ),
+) -> None:
+    """Import an existing draft (Word or markdown) as a new Lattice project.
+
+    Detects whether the doc is already in lattice format, in another
+    structured form (Word headings + bullets), or raw prose. Creates
+    the project tree, drops the right voice file in, optionally seeds
+    the source store from a Zotero / BibTeX / RIS export, and prints
+    the next steps.
+
+    Lowest-friction on-ramp into Lattice. After this command finishes,
+    you'll have a project ready to ingest (or to scaffold via Claude
+    if the import was raw prose).
+    """
+    from ..ingester.import_wizard import import_paper
+
+    if project is None:
+        project = Path.cwd() / document.stem
+    project = project.resolve()
+
+    try:
+        result = import_paper(
+            document=document,
+            project_path=project,
+            voice_name=voice,
+            references_file=references,
+            overwrite=overwrite,
+        )
+    except FileExistsError as e:
+        raise _surface_lattice_error(LatticeError(
+            code="outline_exists",
+            message=str(e),
+            next_step=(
+                "Pass --overwrite to replace, or pick a different "
+                "project directory."
+            ),
+            exit_code=3,
+        ))
+    except (FileNotFoundError, ValueError, ImportError) as e:
+        raise _surface_lattice_error(LatticeError(
+            code="import_failed",
+            message=f"{type(e).__name__}: {e}",
+            next_step=(
+                "Check the document type (.md / .markdown / .txt / .docx) "
+                "and that python-docx is installed for DOCX inputs."
+            ),
+            exit_code=3,
+        ))
+
+    console.print(
+        f"[green]Imported[/green] {document.name} as project "
+        f"[cyan]{result.project_path.name}[/cyan] "
+        f"([dim]{result.document_kind}[/dim])."
+    )
+    console.print(f"  outline   → {result.outline_destination}")
+    if result.sources_imported or result.sources_duplicates:
+        console.print(
+            f"  refs      → {result.sources_imported} added, "
+            f"{result.sources_duplicates} duplicates skipped"
+        )
+    console.print()
+    console.print("[bold]Next steps[/bold]:")
+    for i, step in enumerate(result.next_steps, 1):
+        console.print(f"  {i}. {step}")
+
+
 references_app = typer.Typer(
     help="Reference-store management — import, export, list.",
     no_args_is_help=True,

@@ -198,6 +198,35 @@ For LaTeX users: `lattice references export <project> --format bib --output refs
 
 List the source store as a table. Default limit 50; `--limit 0` shows all.
 
+## Onboarding
+
+### `lattice import <document> [<project>] [--voice academic] [--references <bib-or-json-or-ris>] [--overwrite]`
+
+Import an existing draft (Word or markdown) as a new Lattice project. The lowest-friction on-ramp.
+
+Detects the document kind:
+- **Lattice-format markdown** (already has `# THESIS` / `# A.`) → lands in `structure/outline.md`, ready to ingest.
+- **Structured DOCX** (Heading 1 / Heading 2 / bullet styles) → routed through the existing DOCX ingester; lands in `structure/outline.md`.
+- **Raw prose** (markdown or DOCX) → archived to `structure/outline.raw.md`; the auto-outliner runs on the next Scaffold activity.
+
+Creates the standard project layout (`structure/`, `refs/`, `voices/`, `outputs/`, `.lattice/`), copies the chosen voice file in, and optionally imports a Zotero CSL-JSON / BibTeX / RIS reference library to seed the source store. Refuses to overwrite existing outline files unless `--overwrite` is set.
+
+Prints a tailored next-steps list based on what landed.
+
+### `lattice cookbook [<topic>]`
+
+Show workflow recipes — the curated map behind the 36 commands. Run with no argument for a list of recipes; pass a slug for the full sequence:
+
+- `restyle` — switch a paper between journal styles
+- `from-sources` — write a new chapter from sources
+- `import` — bring an existing draft in
+- `rescaffold` — structural review (metrics → planner → fill loop)
+- `shadow` — find what you missed
+- `presubmit` — comprehensive pre-submission review
+- `references` — manage the reference store
+
+See [`docs/WORKFLOWS.md`](WORKFLOWS.md) for the full reference.
+
 ## Pipeline commands
 
 ### `lattice run <project> --voice <n> [--with-shadow] [--resume] [--max-passes 3] [--min-delta 5] [--review]`
