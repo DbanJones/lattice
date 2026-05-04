@@ -172,6 +172,32 @@ List available per-journal style overrides.
 
 Install the starter library into `voices/journals/` (Nature, Science, IEEE Transactions, British Journal of Political Science, Energy Policy). Idempotent — won't overwrite your customisations.
 
+## Reference store management
+
+A separate verb namespace from `citations` (which works on documents). `references` works on the project's `Source` records — bringing them in from outside the tool, and shipping them back out.
+
+### `lattice references import <project> <file> [--format csl-json|bib|ris] [--dedupe/--no-dedupe] [--dry-run]`
+
+Import references from Zotero CSL-JSON / BibTeX / RIS into the project's source store. Auto-detects the format by suffix; pass `--format` to override.
+
+- **CSL-JSON** (`.json`) — Zotero's native export. Best round-trip; preserves field semantics.
+- **BibTeX** (`.bib`) — the LaTeX standard. Defensive parser handles braced and quoted values.
+- **RIS** (`.ris`) — the lingua franca for reference managers (Mendeley, EndNote).
+
+Dedup (default): skip imports that match an existing source by DOI (case-insensitive) or by `(year, first-author-surname, normalised-title)` hash. `--dry-run` parses + reports without writing.
+
+Pairs with `lattice citations verify` (Crossref/OpenAlex check against imported metadata) and `lattice citations restyle` (re-emit in the destination journal's format).
+
+### `lattice references export <project> [--format bib|ris|csl-json] [--output <path>]`
+
+Export the source store. Default format is `bib`; default output is `refs/export.<suffix>`. Round-trips with `lattice references import`.
+
+For LaTeX users: `lattice references export <project> --format bib --output refs.bib` produces a drop-in `references.bib` for `\bibliography{refs}`.
+
+### `lattice references list <project> [--limit N]`
+
+List the source store as a table. Default limit 50; `--limit 0` shows all.
+
 ## Pipeline commands
 
 ### `lattice run <project> --voice <n> [--with-shadow] [--resume] [--max-passes 3] [--min-delta 5] [--review]`

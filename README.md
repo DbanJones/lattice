@@ -123,6 +123,19 @@ lattice/
 
 The minimum useful end-to-end target: a project with a markdown outline + ~3 PDFs + the academic voice file → coherent rendered output. Get to that before worrying about the more advanced activities.
 
+## Documentation
+
+Three docs you should read in order:
+
+- [`docs/CHEAT_SHEET.md`](docs/CHEAT_SHEET.md) — concepts (claim, cluster, section), tag vocabulary (`[type:]`, `[importance:]`, `[evidence_status:]`, ...), prefix conventions (`MY VIEW:`, `COUNTER:`). One page. Read first.
+- [`docs/WORKFLOWS.md`](docs/WORKFLOWS.md) — recipes for the patterns academics actually use: switching journal styles, writing from sources, importing an existing draft, structural review.
+- [`docs/CLI.md`](docs/CLI.md) — full command reference.
+
+Then, if you need depth:
+- [`docs/SPEC.md`](docs/SPEC.md) — canonical design spec
+- [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) — JSON schemas for every entity
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — what's next, in priority order
+
 ## Key design choices
 
 1. **Claims are atomic, not paragraphs.** The graph is a set of claims plus relationships; prose is generated from the graph, not stored in it.

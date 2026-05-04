@@ -2103,6 +2103,360 @@ def create_app(projects_root: Path | None = None) -> FastAPI:
         )
         return {"source_id": source_id, "saved": True, "about": text[:2000]}
 
+    # ─── Citation pipeline endpoints (Phase 1A) ─────────
+    # Surfaces the references/ package's six-phase pipeline (scan,
+    # match, verify, fill, restyle, journals) in the web UI. These
+    # endpoints are read-mostly + idempotent; the operations they
+    # invoke are CLI-tested already.
+
+    @app.get("/api/projects/{name}/citations")
+    async def get_citations_state(name: str) -> dict[str, Any]:
+        """Return the project's full citation state: scan summary,
+        verifier coverage, undecided fill candidates, available
+        journal styles. Drives the Citations tab dashboard.
+        """
+        from ..references.scanner import load_document_citations
+        from ..references.verifier import load_verification_cache
+        from ..references.filler import (
+            collect_fill_candidates, load_decisions,
+        )
+        from ..references.journal_styles import list_journal_styles
+        from ..output.citation_formatter import supported_styles
+
+        path = _project_path(name)
+        doc = load_document_citations(path)
+        verifications = load_verification_cache(path)
+        decided = load_decisions(path)
+        pending = collect_fill_candidates(verifications, decided=decided)
+
+        return {
+            "has_scan": doc is not None,
+            "scan": (
+                {
+                    "document_path": doc.document_path,
+                    "detected_system": doc.detected_system.value,
+                    "scanned_at": doc.scanned_at.isoformat(),
+                    "counts": doc.counts,
+                }
+                if doc else None
+            ),
+            "verifier": {
+                "verified_count": len(verifications),
+                "matched": sum(1 for v in verifications.values() if v.matched),
+                "errors": sum(
+                    1 for v in verifications.values()
+                    for d in v.discrepancies
+                    if d.severity.value == "error"
+                ),
+                "warnings": sum(
+                    1 for v in verifications.values()
+                    for d in v.discrepancies
+                    if d.severity.value == "warning"
+                ),
+            },
+            "fill": {
+                "decided_count": len(decided),
+                "pending_count": len(pending),
+                "pending_by_severity": {
+                    "error": sum(1 for c in pending if c.severity.value == "error"),
+                    "warning": sum(1 for c in pending if c.severity.value == "warning"),
+                    "info": sum(1 for c in pending if c.severity.value == "info"),
+                },
+            },
+            "available_styles": list(supported_styles()),
+            "available_journals": list_journal_styles(path),
+        }
+
+    @app.post("/api/projects/{name}/citations/scan")
+    async def post_citations_scan(
+        name: str, body: dict[str, Any] | None = Body(None),
+    ) -> dict[str, Any]:
+        """Scan a document. Body: {"document": "<relative-path>",
+        "voice": "academic", "match": true}. document defaults to the
+        rendered paper for the given voice.
+        """
+        from ..references.matcher import match_citations
+        from ..references.scanner import (
+            save_document_citations, scan_document,
+        )
+
+        path = _project_path(name)
+        body = body or {}
+        voice = body.get("voice") or "academic"
+        document_rel = body.get("document")
+        match_flag = body.get("match", True)
+
+        if document_rel:
+            document = (path / document_rel).resolve()
+        else:
+            for cand in (
+                path / "outputs" / f"paper.{voice}.md",
+                path / "structure" / "outline.md",
+                path / "structure" / "outline.raw.md",
+            ):
+                if cand.exists():
+                    document = cand
+                    break
+            else:
+                return {"error": "no_document_found"}
+        if not document.exists():
+            return {"error": "document_not_found", "path": str(document)}
+
+        text = document.read_text(encoding="utf-8")
+        doc = scan_document(
+            text, project_name=path.name, document_path=str(document),
+        )
+        if match_flag:
+            store = GraphStore.load(path)
+            match_citations(doc, store.list_sources())
+
+        save_document_citations(path, doc)
+        return {
+            "ok": True,
+            "document_path": str(document),
+            "detected_system": doc.detected_system.value,
+            "counts": doc.counts,
+        }
+
+    @app.post("/api/projects/{name}/citations/verify")
+    async def post_citations_verify(
+        name: str, body: dict[str, Any] | None = Body(None),
+    ) -> dict[str, Any]:
+        """Verify every source against Crossref + OpenAlex.
+        Body: {"no_cache": false, "crossref_only": false,
+        "openalex_only": false, "email": ""}.
+        """
+        from ..references.scanner import (
+            load_document_citations, save_document_citations,
+        )
+        from ..references.verifier import (
+            VerifierConfig,
+            load_verification_cache,
+            save_verification_cache,
+            verify_sources,
+        )
+
+        path = _project_path(name)
+        body = body or {}
+        store = GraphStore.load(path)
+        sources = store.list_sources()
+        if not sources:
+            return {"error": "no_sources"}
+
+        cache = {} if body.get("no_cache") else load_verification_cache(path)
+        email = body.get("email") or ""
+        cfg = VerifierConfig(
+            user_agent=(
+                f"lattice-citation-verifier/0.1 (mailto:{email})"
+                if email else "lattice-citation-verifier/0.1"
+            ),
+            use_crossref=not body.get("openalex_only", False),
+            use_openalex=not body.get("crossref_only", False),
+        )
+
+        results = await verify_sources(sources, config=cfg, cache=cache)
+        save_verification_cache(path, results)
+
+        doc = load_document_citations(path)
+        if doc is not None:
+            doc.verifications = results
+            save_document_citations(path, doc)
+
+        return {
+            "ok": True,
+            "verified_count": len(results),
+            "matched": sum(1 for v in results.values() if v.matched),
+            "errors": sum(
+                1 for v in results.values()
+                for d in v.discrepancies
+                if d.severity.value == "error"
+            ),
+            "warnings": sum(
+                1 for v in results.values()
+                for d in v.discrepancies
+                if d.severity.value == "warning"
+            ),
+        }
+
+    @app.get("/api/projects/{name}/citations/fill-candidates")
+    async def get_fill_candidates(
+        name: str,
+        severity: str = "info",
+    ) -> dict[str, Any]:
+        """List undecided fill candidates the user should walk."""
+        from ..graph.models import CitationDiscrepancySeverity
+        from ..references.filler import (
+            collect_fill_candidates, load_decisions,
+        )
+        from ..references.verifier import load_verification_cache
+
+        path = _project_path(name)
+        verifications = load_verification_cache(path)
+        decided = load_decisions(path)
+        floor = {
+            "error": CitationDiscrepancySeverity.error,
+            "warning": CitationDiscrepancySeverity.warning,
+            "info": CitationDiscrepancySeverity.info,
+        }.get(severity.lower(), CitationDiscrepancySeverity.info)
+        cands = collect_fill_candidates(
+            verifications, decided=decided, severity_floor=floor,
+        )
+        return {
+            "candidates": [
+                {
+                    "source_id": c.source_id,
+                    "field": c.field,
+                    "paper_value": c.paper_value,
+                    "canonical_value": c.canonical_value,
+                    "severity": c.severity.value,
+                    "verifier": c.verifier.value,
+                    "is_gap_fill": c.is_gap_fill,
+                }
+                for c in cands
+            ],
+        }
+
+    @app.post("/api/projects/{name}/citations/fill")
+    async def post_citations_fill(
+        name: str, body: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        """Apply a list of fill decisions.
+        Body: {"decisions": [{"source_id": "x", "field": "year",
+        "action": "accept_canonical|reject|manual_override|skip",
+        "chosen_value": "..."}]}.
+        """
+        from ..references.filler import (
+            FillCandidate, FillDecision, append_decisions,
+            apply_decisions, collect_fill_candidates, load_decisions,
+        )
+        from ..references.verifier import load_verification_cache
+
+        path = _project_path(name)
+        store = GraphStore.load(path)
+        sources = store.list_sources()
+        verifications = load_verification_cache(path)
+        decided = load_decisions(path)
+        candidates_by_key = {
+            (c.source_id, c.field): c
+            for c in collect_fill_candidates(verifications, decided=decided)
+        }
+
+        decisions: list[FillDecision] = []
+        for d in body.get("decisions") or []:
+            key = (d.get("source_id"), d.get("field"))
+            cand = candidates_by_key.get(key)
+            if cand is None:
+                continue
+            decisions.append(FillDecision(
+                candidate=cand,
+                action=d.get("action", "skip"),
+                chosen_value=d.get("chosen_value", ""),
+            ))
+
+        updated, log = apply_decisions(sources, decisions)
+        for src in updated.values():
+            original = next(
+                (s for s in sources if s.source_id == src.source_id), None,
+            )
+            if original is None or original.model_dump_json() != src.model_dump_json():
+                store.save_source(src)
+        if log:
+            append_decisions(path, log)
+        return {
+            "ok": True,
+            "applied": len(log),
+            "skipped": sum(1 for d in decisions if d.action == "skip"),
+        }
+
+    @app.post("/api/projects/{name}/citations/restyle")
+    async def post_citations_restyle(
+        name: str, body: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        """Restyle a document. Body: {"document": "<rel-path>",
+        "style": "apa", "journal": "nature", "output": "<rel-path>"}.
+        """
+        from ..output.citation_formatter import format_citation, supported_styles
+        from ..references.journal_styles import (
+            format_for_journal, load_journal_style,
+        )
+        from ..references.matcher import match_citations
+        from ..references.rewriter import restyle_document, write_restyled
+        from ..references.scanner import scan_document
+
+        path = _project_path(name)
+        document_rel = body.get("document") or ""
+        style = (body.get("style") or "apa").lower()
+        journal = body.get("journal") or ""
+        output_rel = body.get("output") or ""
+
+        if not document_rel:
+            return {"error": "document_required"}
+        document = (path / document_rel).resolve()
+        if not document.exists():
+            return {"error": "document_not_found", "path": str(document)}
+
+        if style not in supported_styles():
+            return {
+                "error": "unknown_style",
+                "supported": list(supported_styles()),
+            }
+
+        journal_obj = None
+        if journal:
+            try:
+                journal_obj = load_journal_style(path, journal)
+            except (FileNotFoundError, ValueError) as e:
+                return {"error": "journal_load_failed", "detail": str(e)}
+            style = journal_obj.base
+
+        text = document.read_text(encoding="utf-8")
+        doc = scan_document(
+            text, project_name=path.name, document_path=str(document),
+        )
+        store = GraphStore.load(path)
+        sources = store.list_sources()
+        match_citations(doc, sources)
+        result = restyle_document(text, doc, sources, style=style)
+
+        if journal_obj is not None:
+            cited_ids = {
+                ic.source_id for ic in doc.inline_citations if ic.source_id
+            } | {
+                (f.source_id or f.resolves_to_source_id) for f in doc.footnotes
+            }
+            for src in sources:
+                if src.source_id not in cited_ids:
+                    continue
+                override = format_for_journal(src.citation, journal_obj)
+                base = format_citation(src.citation, style)
+                if base.bibliography and base.bibliography in result.document:
+                    result.document = result.document.replace(
+                        base.bibliography, override.bibliography, 1,
+                    )
+            result.style = f"{style}+{journal_obj.name}"
+
+        output_path = (path / output_rel).resolve() if output_rel else None
+        out_path = write_restyled(document, result, output_path=output_path)
+        return {
+            "ok": True,
+            "style": result.style,
+            "output_path": str(out_path),
+            "inline_replaced": result.inline_replaced,
+            "inline_unresolved": result.inline_unresolved,
+            "bibliography_emitted": result.bibliography_emitted,
+        }
+
+    @app.post("/api/projects/{name}/citations/journals/install")
+    async def post_journals_install(name: str) -> dict[str, Any]:
+        """Drop the starter library of journal styles into voices/journals/."""
+        from ..references.journal_styles import write_starter_journal_styles
+        path = _project_path(name)
+        written = write_starter_journal_styles(path)
+        return {
+            "ok": True,
+            "written": [p.stem for p in written],
+        }
+
     @app.get("/api/projects/{name}/run-history")
     async def get_run_history(name: str) -> dict[str, Any]:
         """Return the persisted run history for this project. Used by

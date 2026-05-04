@@ -3284,3 +3284,63 @@ code:not(.path-pill) {
   font-size: 13px;
   color: var(--muted);
 }
+
+/* ─── Citations tab (Phase 1A) ─────────────────────── */
+
+.citations-tab { padding: 18px 22px; }
+.citations-header h2 { margin: 0 0 6px; font-size: 18px; font-weight: 600; }
+.citations-header p { margin: 0 0 18px; max-width: 640px; }
+
+.citations-state { margin-bottom: 18px; }
+.citations-scoreboard {
+  background: var(--surface, #fff);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 8px;
+  padding: 12px 14px;
+  font-size: 13px;
+}
+.cs-row { padding: 4px 0; }
+.cs-row strong { display: inline-block; min-width: 64px; color: var(--muted); }
+
+.citations-panes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 14px;
+  margin-bottom: 18px;
+}
+.citations-pane {
+  background: var(--surface, #fff);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+.citations-pane h3 { margin: 0 0 6px; font-size: 14px; font-weight: 600; }
+.citations-pane p.muted { margin: 0 0 10px; font-size: 12px; line-height: 1.4; }
+.citations-pane .btn { margin-top: 6px; }
+.citations-pane [data-bind$="-detail"] { margin-top: 8px; font-size: 12px; }
+
+.citations-fill-walkthrough {
+  background: var(--surface, #fff);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 8px;
+  padding: 16px 18px;
+}
+.citations-fill-walkthrough.hidden { display: none; }
+.fill-table {
+  width: 100%; border-collapse: collapse; font-size: 12px;
+}
+.fill-table th, .fill-table td {
+  padding: 6px 8px; text-align: left;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+  vertical-align: top;
+}
+.fill-table th { font-weight: 600; color: var(--muted); }
+.fill-table td.paper { color: #92400e; max-width: 240px; word-wrap: break-word; }
+.fill-table td.canon { color: #14532d; max-width: 240px; word-wrap: break-word; }
+.fill-table select {
+  padding: 4px 6px; border: 1px solid var(--border, #e5e7eb); border-radius: 4px;
+}
+
+.badge-error   { background: #fee2e2; color: #991b1b; padding: 1px 6px; border-radius: 99px; font-weight: 600; font-size: 11px; }
+.badge-warning { background: #fef3c7; color: #92400e; padding: 1px 6px; border-radius: 99px; font-weight: 600; font-size: 11px; }
+.badge-info    { background: #dbeafe; color: #1e40af; padding: 1px 6px; border-radius: 99px; font-weight: 600; font-size: 11px; }

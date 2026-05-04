@@ -823,6 +823,7 @@ async function renderProjectDetail(name, sectionId, subSectionId) {
     case "dashboard":  renderDashboardTab(main, subSectionId); break;
     case "activities": renderActivitiesTab(main, subSectionId); break;
     case "sources":    renderSourcesTab(main, subSectionId); break;
+    case "citations":  renderCitationsTab(main, subSectionId); break;
     case "output":     renderOutputTab(main, subSectionId); break;
     // Legacy URLs gracefully redirect.
     case "overview":
@@ -4829,3 +4830,279 @@ async function renderSupervisorReviewSubview(body) {
     });
   });
 }
+
+// ─── Citations tab (Phase 1A) ────────────────────────
+//
+// Surfaces the references/ package's six-phase pipeline:
+//   1. Scan: extract every inline + footnote + bibliography entry
+//   2. Verify: Crossref + OpenAlex per source, surface discrepancies
+//   3. Fill: walk per-field accept/reject for each disagreement
+//   4. Restyle: re-emit the document in any target style or per-journal override
+//
+// Mirrors the CLI subcommands. Pure browser code; no LLM.
+
+function renderCitationsTab(main, subSectionId) {
+  const projSlug = state.current;
+  const panel = main.querySelector('[data-panel="citations"]');
+  const otherPanels = main.querySelectorAll('.subnav-panel');
+  otherPanels.forEach(p => p.classList.toggle('visible', p === panel));
+  panel.innerHTML = `
+    <div class="citations-tab">
+      <header class="citations-header">
+        <h2>Citations</h2>
+        <p class="muted">Scan a document, verify against Crossref + OpenAlex,
+          fill disagreements, restyle for any journal. None of these mutate
+          your outline; verified metadata lands on your sources.</p>
+      </header>
+      <div class="citations-state" data-bind="state">
+        <div class="muted small">Loading…</div>
+      </div>
+      <div class="citations-panes">
+        <section class="citations-pane" data-pane="scan">
+          <h3>1. Scan</h3>
+          <p class="muted small">Detects citation system; extracts inline,
+             footnotes, bibliography. ~50 ms; no LLM.</p>
+          <button class="btn primary" data-action="scan">Scan rendered paper</button>
+          <div class="muted small" data-bind="scan-detail"></div>
+        </section>
+        <section class="citations-pane" data-pane="verify">
+          <h3>2. Verify</h3>
+          <p class="muted small">Look up every source against Crossref +
+             OpenAlex. Cached by content hash; re-runs are free.</p>
+          <label class="filter-row">
+            <input type="email" data-bind="email"
+                   placeholder="email (for Crossref polite-pool)"
+                   style="flex:1; padding:6px 8px; border:1px solid var(--border); border-radius:6px;">
+          </label>
+          <button class="btn primary" data-action="verify">Verify all sources</button>
+          <div class="muted small" data-bind="verify-detail"></div>
+        </section>
+        <section class="citations-pane" data-pane="fill">
+          <h3>3. Fill discrepancies</h3>
+          <p class="muted small">Walk each field where the paper disagrees
+             with Crossref. Decisions are append-only.</p>
+          <button class="btn" data-action="open-fill">Open fill walkthrough</button>
+          <div class="muted small" data-bind="fill-detail"></div>
+        </section>
+        <section class="citations-pane" data-pane="restyle">
+          <h3>4. Restyle</h3>
+          <p class="muted small">Re-emit your document in any base style or
+             per-journal override. Deterministic, instant.</p>
+          <div class="restyle-controls" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+            <select data-bind="restyle-style" style="padding:6px 8px; border:1px solid var(--border); border-radius:6px;"></select>
+            <select data-bind="restyle-journal" style="padding:6px 8px; border:1px solid var(--border); border-radius:6px;">
+              <option value="">— no journal override —</option>
+            </select>
+            <button class="btn" data-action="install-journals">Install starter library</button>
+          </div>
+          <button class="btn primary" data-action="restyle" style="margin-top:8px;">Restyle</button>
+          <div class="muted small" data-bind="restyle-detail"></div>
+        </section>
+      </div>
+      <div class="citations-fill-walkthrough hidden" data-bind="fill-walkthrough"></div>
+    </div>`;
+  refreshCitationsState(panel, projSlug);
+  wireCitationsActions(panel, projSlug);
+}
+
+async function refreshCitationsState(panel, projSlug) {
+  const stateBox = panel.querySelector('[data-bind="state"]');
+  try {
+    const data = await fetchJSON(`/api/projects/${encodeURIComponent(projSlug)}/citations`);
+    const scan = data.scan;
+    const v = data.verifier;
+    const f = data.fill;
+    stateBox.innerHTML = `
+      <div class="citations-scoreboard">
+        <div class="cs-row">
+          <strong>Scan:</strong>
+          ${scan ? `${scan.detected_system} system · ${scan.counts.inline_total} inline · ${scan.counts.bibliography_entries} bibliography entries`
+                 : `<span class="muted">no scan yet</span>`}
+        </div>
+        <div class="cs-row">
+          <strong>Verify:</strong>
+          ${v.verified_count > 0
+            ? `${v.matched}/${v.verified_count} matched · <span class="${v.errors > 0 ? 'badge-error' : ''}">${v.errors} error(s)</span> · ${v.warnings} warning(s)`
+            : `<span class="muted">no verifier cache</span>`}
+        </div>
+        <div class="cs-row">
+          <strong>Fill:</strong>
+          ${f.pending_count > 0
+            ? `${f.pending_count} pending (${f.pending_by_severity.error} error · ${f.pending_by_severity.warning} warning · ${f.pending_by_severity.info} info) · ${f.decided_count} decided`
+            : `<span class="muted">${f.decided_count} decisions recorded</span>`}
+        </div>
+      </div>`;
+    const styleSelect = panel.querySelector('[data-bind="restyle-style"]');
+    styleSelect.innerHTML = (data.available_styles || [])
+      .map(s => `<option value="${s}">${s}</option>`).join('');
+    const journalSelect = panel.querySelector('[data-bind="restyle-journal"]');
+    const opts = ['<option value="">— no journal override —</option>'];
+    (data.available_journals || []).forEach(j =>
+      opts.push(`<option value="${escapeAttr(j)}">${escapeHtml(j)}</option>`));
+    journalSelect.innerHTML = opts.join('');
+  } catch (err) {
+    stateBox.innerHTML = `<div class="muted">Could not load citation state: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function wireCitationsActions(panel, projSlug) {
+  panel.querySelector('[data-action="scan"]').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.textContent = 'Scanning…';
+    try {
+      const r = await postJSON(
+        `/api/projects/${encodeURIComponent(projSlug)}/citations/scan`,
+        { match: true });
+      panel.querySelector('[data-bind="scan-detail"]').textContent =
+        r.error ? `error: ${r.error}` :
+        `${r.detected_system} system · ${r.counts.inline_total} inline · ${r.counts.bibliography_entries} bibliography`;
+    } catch (err) {
+      panel.querySelector('[data-bind="scan-detail"]').textContent = `error: ${err.message}`;
+    } finally {
+      btn.disabled = false; btn.textContent = 'Scan rendered paper';
+      refreshCitationsState(panel, projSlug);
+    }
+  });
+
+  panel.querySelector('[data-action="verify"]').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const email = panel.querySelector('[data-bind="email"]').value;
+    btn.disabled = true; btn.textContent = 'Verifying…';
+    try {
+      const r = await postJSON(
+        `/api/projects/${encodeURIComponent(projSlug)}/citations/verify`,
+        { email });
+      panel.querySelector('[data-bind="verify-detail"]').textContent =
+        r.error ? `error: ${r.error}` :
+        `${r.matched}/${r.verified_count} matched · ${r.errors} error(s) · ${r.warnings} warning(s)`;
+    } catch (err) {
+      panel.querySelector('[data-bind="verify-detail"]').textContent = `error: ${err.message}`;
+    } finally {
+      btn.disabled = false; btn.textContent = 'Verify all sources';
+      refreshCitationsState(panel, projSlug);
+    }
+  });
+
+  panel.querySelector('[data-action="open-fill"]').addEventListener('click',
+    () => openFillWalkthrough(panel, projSlug));
+
+  panel.querySelector('[data-action="install-journals"]').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.textContent = 'Installing…';
+    try {
+      await postJSON(
+        `/api/projects/${encodeURIComponent(projSlug)}/citations/journals/install`,
+        {});
+    } finally {
+      btn.disabled = false; btn.textContent = 'Install starter library';
+      refreshCitationsState(panel, projSlug);
+    }
+  });
+
+  panel.querySelector('[data-action="restyle"]').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const style = panel.querySelector('[data-bind="restyle-style"]').value;
+    const journal = panel.querySelector('[data-bind="restyle-journal"]').value;
+    const detail = panel.querySelector('[data-bind="restyle-detail"]');
+    const document_rel = `outputs/paper.academic.md`;  // sensible default
+    btn.disabled = true; btn.textContent = 'Restyling…';
+    try {
+      const r = await postJSON(
+        `/api/projects/${encodeURIComponent(projSlug)}/citations/restyle`,
+        { style, journal, document: document_rel });
+      if (r.error) {
+        detail.textContent = `error: ${r.error}`;
+      } else {
+        detail.innerHTML =
+          `${r.inline_replaced} inline replaced · ${r.bibliography_emitted} bibliography entries · ` +
+          `<a href="/api/projects/${encodeURIComponent(projSlug)}/file?path=${encodeURIComponent(r.output_path)}" target="_blank">${escapeHtml(r.output_path)}</a>`;
+      }
+    } catch (err) {
+      detail.textContent = `error: ${err.message}`;
+    } finally {
+      btn.disabled = false; btn.textContent = 'Restyle';
+    }
+  });
+}
+
+async function openFillWalkthrough(panel, projSlug) {
+  const wt = panel.querySelector('[data-bind="fill-walkthrough"]');
+  wt.classList.remove('hidden');
+  wt.innerHTML = `<div class="muted">Loading candidates…</div>`;
+  try {
+    const r = await fetchJSON(`/api/projects/${encodeURIComponent(projSlug)}/citations/fill-candidates`);
+    const cands = r.candidates || [];
+    if (!cands.length) {
+      wt.innerHTML = `<div class="empty-state"><h3>Nothing to fill</h3>
+        <p>Either every disagreement is decided, or there are no verified sources yet.</p></div>`;
+      return;
+    }
+    wt.innerHTML = `
+      <h3>Fill ${cands.length} field(s)</h3>
+      <p class="muted small">Pick an action per row. Decisions are append-only.</p>
+      <table class="fill-table">
+        <thead>
+          <tr><th>source</th><th>field</th><th>severity</th><th>paper says</th><th>canonical</th><th>action</th></tr>
+        </thead>
+        <tbody>
+          ${cands.map((c, i) => `
+            <tr data-row="${i}">
+              <td><code>${escapeHtml(c.source_id)}</code></td>
+              <td>${escapeHtml(c.field)}</td>
+              <td><span class="badge-${c.severity}">${c.severity}</span></td>
+              <td class="paper">${escapeHtml(c.paper_value || '(empty)')}</td>
+              <td class="canon">${escapeHtml(c.canonical_value || '(empty)')}</td>
+              <td>
+                <select data-bind="action">
+                  <option value="skip">skip</option>
+                  <option value="accept_canonical">accept canonical</option>
+                  <option value="reject">keep paper</option>
+                  <option value="manual_override">manual…</option>
+                </select>
+                <input type="text" data-bind="manual" placeholder="manual value" class="hidden"
+                       style="width:140px; margin-left:6px; padding:4px 6px;">
+              </td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+      <button class="btn primary" data-action="apply-fill" style="margin-top:12px;">Apply decisions</button>
+    `;
+    // Show manual-override input only when its action is selected.
+    wt.querySelectorAll('select[data-bind="action"]').forEach(sel => {
+      sel.addEventListener('change', () => {
+        const manual = sel.parentElement.querySelector('[data-bind="manual"]');
+        manual.classList.toggle('hidden', sel.value !== 'manual_override');
+      });
+    });
+    wt.querySelector('[data-action="apply-fill"]').addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true; btn.textContent = 'Applying…';
+      const decisions = [];
+      wt.querySelectorAll('tbody tr').forEach((tr, i) => {
+        const action = tr.querySelector('[data-bind="action"]').value;
+        const manual = tr.querySelector('[data-bind="manual"]').value;
+        decisions.push({
+          source_id: cands[i].source_id,
+          field: cands[i].field,
+          action,
+          chosen_value: manual,
+        });
+      });
+      try {
+        const out = await postJSON(
+          `/api/projects/${encodeURIComponent(projSlug)}/citations/fill`,
+          { decisions });
+        wt.innerHTML = `<div class="empty-state"><h3>Applied</h3>
+          <p>${out.applied} decision(s) recorded; ${out.skipped} skipped.</p></div>`;
+        refreshCitationsState(panel, projSlug);
+      } catch (err) {
+        btn.disabled = false; btn.textContent = 'Apply decisions';
+        alert(`Failed: ${err.message}`);
+      }
+    });
+  } catch (err) {
+    wt.innerHTML = `<div class="muted">Failed to load: ${escapeHtml(err.message)}</div>`;
+  }
+}
+

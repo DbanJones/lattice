@@ -53,35 +53,53 @@ from ..output.visualise import render_tree, write_html, write_mermaid
 from ..renderer.parallel import ParallelRenderer
 from ..shadow import ShadowMapper
 from ..utils.config import Config
+from ..utils.errors import (
+    LatticeError,
+    err_claude_unavailable,
+    err_project_not_found,
+    err_unknown_voice,
+)
 from ..utils.llm import ClaudeClient, claude_available
 from ..utils.resume import ResumeManager, StageStatus
 from ..voice.parser import Voice
 from .run import PipelineRunner
 
 
+def _surface_lattice_error(err: LatticeError) -> typer.Exit:
+    """Render a LatticeError to the console and return a typer.Exit.
+
+    Two-line shape:
+        [red]error: message[/red]
+        [yellow]→ next_step[/yellow]
+        [dim]docs: docs_link[/dim]   (only when present)
+
+    Call sites use ``raise _surface_lattice_error(err)`` so the exit
+    code propagates through typer.
+    """
+    console.print(f"[red]error[/red]: {err.message}")
+    console.print(f"[yellow]→[/yellow] {err.next_step}")
+    if err.docs_link:
+        console.print(f"[dim]docs: {err.docs_link}[/dim]")
+    return typer.Exit(code=err.exit_code)
+
+
 def _load_voice(project: Path, voice_name: str) -> Voice:
     voice_path = project / "voices" / f"{voice_name}.voice.md"
     if not voice_path.exists():
-        console.print(f"[red]Voice not found: {voice_path}[/red]")
-        raise typer.Exit(code=3)
+        raise _surface_lattice_error(err_unknown_voice(voice_name, str(voice_path)))
     return Voice.from_file(voice_path)
 
 
 def _require_project(project: Path) -> Path:
     project = project.resolve()
     if not project.exists():
-        console.print(f"[red]Project not found: {project}[/red]")
-        raise typer.Exit(code=3)
+        raise _surface_lattice_error(err_project_not_found(str(project)))
     return project
 
 
 def _require_claude() -> None:
     if not claude_available():
-        console.print(
-            "[red]Claude Code CLI not found. Install Claude Code so `claude` "
-            "is on PATH, or set LATTICE_CLAUDE_CMD to the binary path.[/red]"
-        )
-        raise typer.Exit(code=2)
+        raise _surface_lattice_error(err_claude_unavailable())
 
 app = typer.Typer(
     name="lattice",
@@ -1309,6 +1327,196 @@ def _prompt_via_editor(cand) -> str:
         if line.strip() and not line.lstrip().startswith("#")
     ]
     return " ".join(body_lines).strip()
+
+
+references_app = typer.Typer(
+    help="Reference-store management — import, export, list.",
+    no_args_is_help=True,
+)
+app.add_typer(references_app, name="references")
+
+
+@references_app.command("import")
+def references_import(
+    project: Path = typer.Argument(...),
+    file: Path = typer.Argument(
+        ..., exists=True, readable=True,
+        help="Reference file: .json (Zotero CSL-JSON) / .bib / .ris",
+    ),
+    format: str = typer.Option(
+        "", "--format", "-f",
+        help="Force a format: csl-json / bib / ris. Default: detect "
+             "from file suffix.",
+    ),
+    dedupe: bool = typer.Option(
+        True, "--dedupe/--no-dedupe",
+        help="Skip imports that match an existing source by DOI or "
+             "by (year, surname, title) hash.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Parse + report; don't write to the source store.",
+    ),
+) -> None:
+    """Import references from Zotero / BibTeX / RIS into the project's
+    source store.
+
+    Most academics already have a curated reference library; this is
+    the on-ramp into Lattice without re-tagging by hand. Pairs with
+    `lattice citations verify` (Crossref/OpenAlex check) and
+    `lattice citations restyle` (output in any format) so a complete
+    workflow is: import → verify → restyle for each submission.
+    """
+    from ..references.importers import (
+        import_references_from_file,
+        merge_into_store,
+    )
+    from ..utils.errors import LatticeError
+
+    project = _require_project(project)
+    Config.load(project)
+    fmt = format.strip().lower() or None
+
+    try:
+        report = import_references_from_file(file, format=fmt)
+    except Exception as e:  # noqa: BLE001
+        raise _surface_lattice_error(LatticeError(
+            code="reference_import_failed",
+            message=f"Could not parse {file.name}: {type(e).__name__}: {e}",
+            next_step="Check the file format. Try --format csl-json|bib|ris.",
+            exit_code=3,
+        ))
+
+    if not report.sources:
+        console.print(
+            f"[yellow]Parsed {file.name} ({report.detected_format}) "
+            f"but no usable entries.[/yellow]"
+        )
+        if report.warnings:
+            for w in report.warnings:
+                console.print(f"  warning: {w}")
+        if report.skipped:
+            console.print(f"  skipped: {len(report.skipped)} entries")
+        raise typer.Exit(code=3)
+
+    store = GraphStore.load(project)
+    existing = store.list_sources()
+    if dedupe:
+        merged, decisions = merge_into_store(report.sources, existing)
+        added = sum(1 for v in decisions.values() if v == "added")
+        duplicates = sum(1 for v in decisions.values() if v == "duplicate")
+    else:
+        merged = list(existing) + list(report.sources)
+        added = len(report.sources)
+        duplicates = 0
+
+    if dry_run:
+        console.print(
+            f"[cyan][dry-run][/cyan] would add {added} source(s); "
+            f"would skip {duplicates} duplicate(s); "
+            f"{len(report.skipped)} unparseable entries."
+        )
+        return
+
+    # Persist new sources only.
+    new_ids = {s.source_id for s in merged} - {s.source_id for s in existing}
+    for src in merged:
+        if src.source_id in new_ids:
+            store.save_source(src)
+
+    console.print(
+        f"[green]Imported[/green] {added} source(s) from {file.name} "
+        f"({report.detected_format}). "
+        f"Skipped {duplicates} duplicate(s); "
+        f"{len(report.skipped)} unparseable."
+    )
+    if report.warnings:
+        for w in report.warnings[:5]:
+            console.print(f"  [yellow]warning[/yellow]: {w}")
+
+
+@references_app.command("export")
+def references_export(
+    project: Path = typer.Argument(...),
+    format: str = typer.Option(
+        "bib", "--format", "-f",
+        help="Output format: bib (BibTeX), ris, or csl-json (Zotero).",
+    ),
+    output: Path = typer.Option(
+        None, "--output", "-o",
+        help="Output path (default: refs/export.<suffix> in the project).",
+    ),
+) -> None:
+    """Export the project's source store to BibTeX / RIS / CSL-JSON.
+
+    Pairs with `lattice citations verify` to produce a canonical
+    bibliography that drops cleanly into a LaTeX project (`.bib`),
+    another reference manager (`.ris`), or Zotero (`csl-json`).
+    """
+    from ..references.exporters import (
+        export_references,
+        supported_export_formats,
+    )
+    from ..utils.errors import LatticeError, err_no_sources, err_unknown_style
+
+    project = _require_project(project)
+    Config.load(project)
+    store = GraphStore.load(project)
+    sources = store.list_sources()
+    if not sources:
+        raise _surface_lattice_error(err_no_sources(str(project)))
+
+    try:
+        text, suffix = export_references(sources, format)
+    except ValueError:
+        raise _surface_lattice_error(err_unknown_style(
+            format, supported_export_formats(),
+        ))
+
+    if output is None:
+        output = project / "refs" / f"export.{suffix}"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(text, encoding="utf-8")
+    console.print(
+        f"[green]Exported[/green] {len(sources)} source(s) "
+        f"({format}) → {output}"
+    )
+
+
+@references_app.command("list")
+def references_list(
+    project: Path = typer.Argument(...),
+    limit: int = typer.Option(50, "--limit", "-n",
+                              help="Show at most N entries (0 = all)."),
+) -> None:
+    """List the project's source store."""
+    project = _require_project(project)
+    Config.load(project)
+    store = GraphStore.load(project)
+    sources = store.list_sources()
+    if not sources:
+        console.print("[dim]No sources in the store.[/dim]")
+        return
+    table = Table(title=f"{len(sources)} source(s) in {project.name}")
+    table.add_column("source_id", style="cyan")
+    table.add_column("year", justify="right")
+    table.add_column("authors")
+    table.add_column("title")
+    shown = sources if limit == 0 else sources[:limit]
+    for src in shown:
+        c = src.citation
+        authors = ", ".join(c.authors[:2]) if c.authors else "?"
+        if c.authors and len(c.authors) > 2:
+            authors += " et al."
+        table.add_row(
+            src.source_id,
+            str(c.year) if c.year else "?",
+            authors[:40],
+            (c.title or "")[:60],
+        )
+    console.print(table)
+    if limit and len(sources) > limit:
+        console.print(f"[dim]...and {len(sources) - limit} more (use --limit 0 to show all)[/dim]")
 
 
 citations_app = typer.Typer(
