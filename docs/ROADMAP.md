@@ -3,6 +3,15 @@
 Prioritised by `(impact × adoption-unlock) ÷ effort`. Phases can run in
 parallel; each exits when its acceptance criteria pass.
 
+> **Status (May 2026):** the seven argument-first revision-foundation phases
+> tracked in [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) (vocabulary
+> cleanup, graph fixes, Revision Cockpit, evidence retrieval + traces,
+> rewrite proposals, map modes, provenance + versioning) are **shipped**.
+> 906 tests pass. The roadmap below is the longer-term vector on top of
+> that foundation; Phase 8 of the implementation plan (evaluation suite +
+> Windows test hardening) is the only foundational item still open and
+> tracks separately.
+
 ## Phase 1 — Make the strongest piece visible (1–2 weeks)
 
 The citation pipeline is the most differentiated work in the tool and is

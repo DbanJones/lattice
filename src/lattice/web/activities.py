@@ -69,6 +69,13 @@ class ActivityRequest:
     chunk_max: int = 4                   # draft only
     force: bool = False                  # draft only
     nesting_depth: int = 2               # scaffold only — 1=flat, 2=##, 3=###
+    # Phase 5/7: optional redraft mode + post-render claim
+    # preservation enforcement. When ``redraft_mode`` is set the
+    # renderer applies the matching prelude; if any cluster's prose
+    # fails the claim-preservation check, that cluster is marked
+    # ``failed`` so the finaliser refuses to deliver and the user
+    # can revert via the snapshot taken before the run.
+    redraft_mode: str | None = None      # draft only
 
 
 # ─── state derivation ────────────────────────────
@@ -77,9 +84,11 @@ class ActivityRequest:
 def project_state(project_path: Path) -> dict[str, Any]:
     """Compute current project state and per-activity blockers.
 
-    Returns ``{"state": "S0".."S4", "blockers": {verb: msg|None}, "markers": {...}}``.
-    The frontend uses this single payload to decide which activity
-    cards to render as locked vs. ready.
+    Returns ``{"state": "S0".."S4", "blockers": {verb: msg|None},
+    "next_activity": {"verb": ..., "label": ..., "why": ...},
+    "markers": {...}}``. The frontend uses this single payload to
+    decide which activity cards to render as locked vs. ready and
+    which activity to recommend as the next step.
     """
     structure_dir = project_path / "structure"
     outline_md = structure_dir / "outline.md"
@@ -135,9 +144,19 @@ def project_state(project_path: Path) -> dict[str, Any]:
         ),
     }
 
+    next_activity = _recommend_next_activity(
+        state=state,
+        has_outline=has_outline,
+        has_graph=has_graph,
+        has_clusters=has_clusters,
+        has_paper=has_paper,
+        has_audit_flags=has_audit_flags,
+    )
+
     return {
         "state": state,
         "blockers": blockers,
+        "next_activity": next_activity,
         "markers": {
             "has_outline": has_outline,
             "has_graph": has_graph,
@@ -146,6 +165,64 @@ def project_state(project_path: Path) -> dict[str, Any]:
             "has_audit_flags": has_audit_flags,
             "paper_files": [p.name for p in paper_files],
         },
+    }
+
+
+_ACTIVITY_LABELS: dict[str, str] = {
+    "ingest": "Ingest",
+    "scaffold": "Scaffold",
+    "draft": "Draft",
+    "find_gaps": "Find gaps",
+    "refine": "Refine",
+    "restructure": "Restructure",
+    "review": "Review",
+}
+
+
+def _recommend_next_activity(
+    *,
+    state: str,
+    has_outline: bool,
+    has_graph: bool,
+    has_clusters: bool,
+    has_paper: bool,
+    has_audit_flags: bool,
+) -> dict[str, str]:
+    """Pick the single best next activity for the current project state.
+
+    Used by the frontend to render a "what next?" prompt on the
+    dashboard, empty states, and action items. The activity model
+    (Ingest, Scaffold, Draft, Find gaps, Refine, Restructure, Review)
+    replaces the older quick/standard/deep review levels.
+    """
+    if not has_outline:
+        return {
+            "verb": "scaffold",
+            "label": _ACTIVITY_LABELS["scaffold"],
+            "why": "Add an outline, then run Scaffold to build the argument graph.",
+        }
+    if not (has_graph and has_clusters):
+        return {
+            "verb": "scaffold",
+            "label": _ACTIVITY_LABELS["scaffold"],
+            "why": "Outline is ready — run Scaffold to parse it into claims and clusters.",
+        }
+    if not has_paper:
+        return {
+            "verb": "draft",
+            "label": _ACTIVITY_LABELS["draft"],
+            "why": "Scaffold is ready — run Draft to render prose for the first time.",
+        }
+    if not has_audit_flags:
+        return {
+            "verb": "refine",
+            "label": _ACTIVITY_LABELS["refine"],
+            "why": "Draft exists — run Refine to audit the prose and surface flags.",
+        }
+    return {
+        "verb": "review",
+        "label": _ACTIVITY_LABELS["review"],
+        "why": "Audit is in. Run Review for a supervisor-style critique.",
     }
 
 
@@ -179,6 +256,36 @@ async def run_activity(
             "detail": blocker,
         })
         return result
+
+    # Phase 7: snapshot the project state before running the activity
+    # so the run is recoverable. ``ingest`` skipped because it's pure
+    # re-derivation from the outline file — nothing graph-side
+    # changes that wasn't already on disk. The snapshot is best-effort:
+    # if the snapshot fails (e.g. permissions), we still let the
+    # activity proceed rather than blocking the user.
+    if request.verb != "ingest":
+        try:
+            from ..graph.models import SnapshotKind
+            kind_map = {
+                "scaffold": SnapshotKind.before_scaffold,
+                "draft": SnapshotKind.before_draft,
+                "find_gaps": SnapshotKind.before_find_gaps,
+                "refine": SnapshotKind.before_refine,
+                "restructure": SnapshotKind.before_restructure,
+                "review": SnapshotKind.before_review,
+            }
+            snap_kind = kind_map.get(request.verb, SnapshotKind.manual)
+            store_for_snapshot = GraphStore.load(request.project_path)
+            snap = store_for_snapshot.create_snapshot(
+                kind=snap_kind,
+                actor=f"activity:{request.verb}",
+                message=f"Pre-{request.verb} snapshot ({request.mode} mode)",
+            )
+            result.notes.append(f"snapshot taken: {snap.snapshot_id}")
+        except Exception as exc:  # noqa: BLE001 — snapshot is best-effort
+            result.notes.append(
+                f"snapshot failed: {type(exc).__name__}: {exc}"
+            )
 
     # Ingest is purely deterministic — no LLM involved — so it should
     # work even without Claude on PATH (and without a configured voice).
@@ -687,9 +794,21 @@ async def _activity_draft(
 
     # ── 1. Render ──
     progress.begin_pass(1, 1)
+    # Phase 5/7: thread the redraft mode through to the renderer so
+    # the system prompt's redraft prelude fires.
+    redraft_mode_enum = None
+    if request.redraft_mode:
+        try:
+            from ..graph.models import RedraftMode
+            redraft_mode_enum = RedraftMode(request.redraft_mode)
+        except ValueError:
+            result.notes.append(
+                f"Unknown redraft_mode '{request.redraft_mode}' — running default."
+            )
     renderer = ChunkedRenderer(
         config, store, llm, voice,
         min_chunk=request.chunk_min, max_chunk=request.chunk_max,
+        redraft_mode=redraft_mode_enum,
     )
     rendered = await renderer.render_all(
         force=request.force, progress=progress
@@ -698,6 +817,40 @@ async def _activity_draft(
         1 for r in rendered.values()
         if r and "CLUSTER_UNRENDERABLE" not in r
     )
+
+    # Phase 5/7: claim-preservation enforcement on redraft passes.
+    # When a redraft mode is set, walk every rendered cluster and
+    # verify its prose still carries the distinctive vocabulary of
+    # every required claim. Clusters that drop claims are marked
+    # ``failed`` so the finaliser refuses to deliver — recovery is
+    # via the pre-activity snapshot already taken by the dispatcher.
+    if redraft_mode_enum is not None:
+        from ..renderer.chunked_renderer import verify_claims_preserved
+        store_for_check = GraphStore.load(project)
+        claims_by_id = {c.claim_id: c for c in store_for_check.get_graph().claims}
+        flunked: list[str] = []
+        for cluster in store_for_check.list_clusters():
+            prose = rendered.get(cluster.cluster_id, "")
+            if not prose or "CLUSTER_UNRENDERABLE" in prose:
+                continue
+            dropped = verify_claims_preserved(cluster, prose, claims_by_id)
+            if dropped:
+                cluster.prose_state = ProseState.failed
+                store_for_check.save_cluster(cluster)
+                flunked.append(cluster.cluster_id)
+                result.notes.append(
+                    f"redraft check: {cluster.cluster_id} dropped claims "
+                    f"{', '.join(dropped)} — marked failed; revert via snapshot."
+                )
+        if flunked:
+            progress._emit({
+                "type": "redraft_claim_loss",
+                "verb": request.verb,
+                "redraft_mode": request.redraft_mode,
+                "failed_clusters": flunked,
+            })
+            # Reload the store so the finaliser sees the failed states.
+            store = GraphStore.load(project)
 
     # ── 2. Finalise ──
     progress.begin("finalise", status="checking readiness")

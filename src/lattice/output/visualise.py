@@ -484,6 +484,22 @@ def build_visualisation_payload(
     }
 
 
+_DEFAULT_CYTOSCAPE_URL = "https://unpkg.com/cytoscape@3.30.1/dist/cytoscape.min.js"
+
+
+# Phase 6 — map modes. Each mode answers a single question.
+# The list is shipped to the frontend so the mode picker stays in
+# sync with what the JS overlay actually understands.
+MAP_MODES: tuple[str, ...] = (
+    "default",
+    "thesis_support_path",
+    "section_proof_chain",
+    "weak_evidence_zones",
+    "counterargument_map",
+    "unrenderable_clusters",
+)
+
+
 def render_html(
     graph: AuthorGraph,
     clusters: list[Cluster] | None = None,
@@ -491,6 +507,8 @@ def render_html(
     drafts_dir: Path | None = None,
     audit_flags_by_cluster: dict[str, int] | None = None,
     readiness_blocking_clusters: set[str] | None = None,
+    cytoscape_url: str | None = None,
+    mode: str | None = None,
 ) -> str:
     """Self-contained HTML page with cytoscape.js loading the graph as JSON.
 
@@ -499,9 +517,16 @@ def render_html(
     ``audit_flags_by_cluster`` / ``readiness_blocking_clusters`` are
     provided, claims inside flagged or blocked clusters get badges.
 
-    For backwards compatibility, all the new arguments are optional —
-    callers that pass only ``graph`` get the original flat-node diagram
-    (with the enriched per-claim data still attached).
+    ``cytoscape_url`` controls where the cytoscape.js library is loaded
+    from. The default points at the unpkg CDN so that the standalone
+    ``outputs/argument_graph.html`` file works when opened directly in
+    a browser. The web app overrides this to a vendored
+    ``/static/vendor/cytoscape/cytoscape.min.js`` so the live UI works
+    offline.
+
+    For backwards compatibility, all the optional arguments default to
+    ``None`` — callers that pass only ``graph`` get the original
+    flat-node diagram (with the enriched per-claim data still attached).
     """
     enriched = build_visualisation_payload(
         graph,
@@ -636,6 +661,9 @@ def render_html(
             }
         })
 
+    resolved_mode = mode if mode in MAP_MODES else "default"
+    meta_payload = {**enriched["meta"], "mode": resolved_mode,
+                    "available_modes": list(MAP_MODES)}
     payload = json.dumps({
         "nodes": nodes,
         "edges": edges,
@@ -653,12 +681,16 @@ def render_html(
             if _include_section(s)
         ],
         "clusters": enriched["clusters"],
-        "meta": enriched["meta"],
+        "meta": meta_payload,
     })
     project_title = html.escape(graph.project_name or "Argument graph")
 
-    return _HTML_TEMPLATE.replace("__TITLE__", project_title).replace(
-        "__ELEMENTS__", payload
+    cyto_src = html.escape(cytoscape_url or _DEFAULT_CYTOSCAPE_URL, quote=True)
+    return (
+        _HTML_TEMPLATE
+        .replace("__TITLE__", project_title)
+        .replace("__CYTOSCAPE_URL__", cyto_src)
+        .replace("__ELEMENTS__", payload)
     )
 
 
@@ -711,7 +743,7 @@ _HTML_TEMPLATE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>__TITLE__ — argument graph</title>
-<script src="https://unpkg.com/cytoscape@3.30.1/dist/cytoscape.min.js"></script>
+<script src="__CYTOSCAPE_URL__"></script>
 <style>
   :root {
     --border:#e5e7eb; --muted:#6b7280; --bg:#fafafa; --surface:#fff;
@@ -840,6 +872,16 @@ _HTML_TEMPLATE = """<!doctype html>
     <div class="legend-row"><span class="legend-swatch" style="background:#fef3c7;border-color:#f59e0b;border-width:2px;"></span><span>Thesis</span></div>
     <div class="legend-row"><span class="legend-swatch" style="background:#fff;border-color:#9ca3af;"></span><span>Empirical</span></div>
     <div class="legend-row"><span class="legend-swatch" style="background:#fff;border-color:#3b82f6;border-radius:50%;"></span><span>User synthesis (round)</span></div>
+    <h4>Map mode</h4>
+    <select id="map-mode-picker" style="width:100%; padding:5px 6px; font-size:12px; border:1px solid var(--border); border-radius:4px; background:var(--surface); font-family:inherit;">
+      <option value="default">Default — full graph</option>
+      <option value="thesis_support_path">Thesis support path</option>
+      <option value="section_proof_chain">Section proof chain</option>
+      <option value="weak_evidence_zones">Weak evidence zones</option>
+      <option value="counterargument_map">Counterargument map</option>
+      <option value="unrenderable_clusters">Unrenderable clusters</option>
+    </select>
+    <p id="map-mode-hint" class="muted" style="margin:6px 0 0; font-size:11px; line-height:1.4; color:var(--muted);"></p>
     <h4>Filters</h4>
     <div id="filter-rows">
       <label class="filter-row"><input type="checkbox" data-filter="unsupported"> only unsupported claims</label>
@@ -1040,6 +1082,11 @@ const cy = cytoscape({
     }},
     { selector: 'edge.dimmed', style: { 'opacity': 0.1 }},
     { selector: 'edge.highlight', style: { 'opacity': 1, 'width': 3 }},
+    // Phase 6: selection ring driven by postMessage from the cockpit.
+    { selector: 'node.selected-from-parent', style: {
+        'border-color': '#1d4ed8', 'border-width': 4,
+        'border-opacity': 1,
+    }},
 
     // ── Phase 3: compound section + cluster nodes ──
     // Section compound: a soft tinted container so claims grouped under
@@ -1203,9 +1250,25 @@ cy.on('tap', 'node', evt => {
 cy.on('tap', 'edge', evt => {
   const d = evt.target.data();
   info.classList.remove('empty');
-  let h = `<h3>${escapeHtml(d.type)}</h3>`;
-  h += `<div class="meta">${escapeHtml(d.source)} → ${escapeHtml(d.target)}</div>`;
-  if (d.label && d.label !== d.type) h += `<p>${escapeHtml(d.label)}</p>`;
+  // Resolve the connected claim labels so the relationship reads as
+  // "<source claim> → <target claim>" rather than as bare IDs.
+  const srcNode = cy.getElementById(d.source);
+  const tgtNode = cy.getElementById(d.target);
+  const srcLabel = srcNode && srcNode.data ? (srcNode.data('label') || d.source) : d.source;
+  const tgtLabel = tgtNode && tgtNode.data ? (tgtNode.data('label') || d.target) : d.target;
+  const strengthBadge = d.strength
+    ? `<span class="badge badge-muted">${escapeHtml(d.strength)}</span>`
+    : '';
+  let h = `<h3>${escapeHtml(d.type)} ${strengthBadge}</h3>`;
+  h += `<div class="meta">${escapeHtml(srcLabel)} → ${escapeHtml(tgtLabel)}</div>`;
+  if (d.note) {
+    // The relationship note carries the *why* — surface it prominently
+    // because that's the useful content for an academic argument map.
+    h += `<p style="margin-top:10px; padding:10px; background:#f9fafb; border-left:3px solid var(--accent); border-radius:4px; line-height:1.5;">${escapeHtml(d.note)}</p>`;
+  }
+  h += `<div class="meta" style="margin-top:8px;">`;
+  h += `<code style="font-size:11px;">${escapeHtml(d.source)} → ${escapeHtml(d.target)}</code>`;
+  h += `</div>`;
   info.innerHTML = h;
 });
 cy.on('tap', evt => {
@@ -1309,6 +1372,260 @@ const edgeFilterEl = document.getElementById('edge-filter');
     if (evt.target.checked) enabledEdgeTypes.add(v); else enabledEdgeTypes.delete(v);
     applyFilters();
   });
+});
+
+// ── Phase 6 — map modes ─────────────────────────────────────
+//
+// Each mode answers a single question by dimming everything that
+// isn't relevant. Modes are pure overlays — they reuse the existing
+// `dimmed` / `highlight` cytoscape classes and never touch the
+// underlying graph data, so switching modes is cheap and reversible.
+//
+// Modes:
+//   default                — no overlay, full graph visible.
+//   thesis_support_path    — claims connected (transitively) to
+//                            cl.thesis via supports / is_evidence_for.
+//   section_proof_chain    — only intra-section edges and their
+//                            endpoints; cross-section relationships dimmed.
+//   weak_evidence_zones    — claims whose evidence is unbound /
+//                            source_hint / contradictory.
+//   counterargument_map    — claims and edges involving contradicts /
+//                            is_counterexample_to / qualifies.
+//   unrenderable_clusters  — clusters with a {CLUSTER_UNRENDERABLE}
+//                            marker plus their child claims.
+
+const MODE_HINTS = {
+  default: 'Showing every node and edge.',
+  thesis_support_path: 'Highlighting the chain of claims that supports the thesis.',
+  section_proof_chain: 'Highlighting intra-section reasoning; cross-section edges dimmed.',
+  weak_evidence_zones: 'Highlighting claims with unbound, source-hint, or contradictory evidence.',
+  counterargument_map: 'Highlighting counter-claims and the edges that engage them.',
+  unrenderable_clusters: 'Highlighting clusters that emitted MISSING_CLAIM or CLUSTER_UNRENDERABLE markers.',
+};
+
+let activeMapMode = 'default';
+
+function clearMapMode() {
+  cy.batch(() => {
+    cy.elements().removeClass('dimmed highlight');
+  });
+}
+
+function applyMapMode(mode) {
+  if (!Object.prototype.hasOwnProperty.call(MODE_HINTS, mode)) {
+    mode = 'default';
+  }
+  activeMapMode = mode;
+  const picker = document.getElementById('map-mode-picker');
+  if (picker && picker.value !== mode) picker.value = mode;
+  const hint = document.getElementById('map-mode-hint');
+  if (hint) hint.textContent = MODE_HINTS[mode] || '';
+
+  if (mode === 'default') {
+    clearMapMode();
+    return;
+  }
+  const highlightedNodes = new Set();
+  const highlightedEdges = new Set();
+  if (mode === 'thesis_support_path') {
+    computeThesisSupportPath(highlightedNodes, highlightedEdges);
+  } else if (mode === 'section_proof_chain') {
+    computeSectionProofChain(highlightedNodes, highlightedEdges);
+  } else if (mode === 'weak_evidence_zones') {
+    computeWeakEvidenceZones(highlightedNodes, highlightedEdges);
+  } else if (mode === 'counterargument_map') {
+    computeCounterargumentMap(highlightedNodes, highlightedEdges);
+  } else if (mode === 'unrenderable_clusters') {
+    computeUnrenderableClusters(highlightedNodes, highlightedEdges);
+  }
+  cy.batch(() => {
+    cy.nodes().forEach(n => {
+      if (highlightedNodes.has(n.id())) {
+        n.removeClass('dimmed').addClass('highlight');
+      } else if (n.data('type') === 'section' || n.data('type') === 'cluster') {
+        // Compound nodes follow their children — surface a parent
+        // when any child claim is highlighted.
+        const anyChild = n.children().some(c => highlightedNodes.has(c.id()));
+        if (anyChild) n.removeClass('dimmed').addClass('highlight');
+        else n.removeClass('highlight').addClass('dimmed');
+      } else {
+        n.removeClass('highlight').addClass('dimmed');
+      }
+    });
+    cy.edges().forEach(e => {
+      if (highlightedEdges.has(e.id())) {
+        e.removeClass('dimmed').addClass('highlight');
+      } else {
+        e.removeClass('highlight').addClass('dimmed');
+      }
+    });
+  });
+}
+
+function computeThesisSupportPath(nodes, edges) {
+  // BFS backwards from cl.thesis along edges whose target is in the
+  // visited set and whose type is supports / is_evidence_for /
+  // extends. The cytoscape edges go from supporter → thesis, so we
+  // walk by `target`.
+  const supportTypes = new Set(['supports', 'is_evidence_for', 'extends']);
+  const visited = new Set();
+  const queue = ['cl.thesis'];
+  while (queue.length) {
+    const current = queue.shift();
+    if (visited.has(current)) continue;
+    visited.add(current);
+    cy.edges().forEach(e => {
+      const d = e.data();
+      if (d.target === current && supportTypes.has(d.type)) {
+        edges.add(d.id);
+        if (!visited.has(d.source)) queue.push(d.source);
+      }
+    });
+  }
+  visited.forEach(id => nodes.add(id));
+}
+
+function computeSectionProofChain(nodes, edges) {
+  // Highlight every claim node and every edge whose source and
+  // target sit in the same top-level section family. Cross-section
+  // edges fall away.
+  const topAncestor = sid => {
+    let cur = data.sections.find(s => s.id === sid);
+    while (cur && cur.parent) {
+      const next = data.sections.find(s => s.id === cur.parent);
+      if (!next) break;
+      cur = next;
+    }
+    return cur ? cur.id : sid;
+  };
+  cy.nodes().forEach(n => {
+    if (n.data('type') === 'thesis') return;
+    if (n.data('sectionId')) nodes.add(n.id());
+  });
+  cy.edges().forEach(e => {
+    const src = cy.getElementById(e.data('source'));
+    const tgt = cy.getElementById(e.data('target'));
+    if (!src || !tgt) return;
+    const ssec = src.data('sectionId');
+    const tsec = tgt.data('sectionId');
+    if (!ssec || !tsec) return;
+    if (topAncestor(ssec) === topAncestor(tsec)) {
+      edges.add(e.id());
+    }
+  });
+}
+
+function computeWeakEvidenceZones(nodes, edges) {
+  cy.nodes().forEach(n => {
+    const eq = n.data('evidenceQuality');
+    if (eq === 'unbound' || eq === 'source_hint' || eq === 'contradictory') {
+      nodes.add(n.id());
+    }
+  });
+  // Also surface any edges between two weak-evidence claims so the
+  // user can see clusters of fragility, not just orphan dots.
+  cy.edges().forEach(e => {
+    if (nodes.has(e.data('source')) && nodes.has(e.data('target'))) {
+      edges.add(e.id());
+    }
+  });
+}
+
+function computeCounterargumentMap(nodes, edges) {
+  const counterTypes = new Set([
+    'contradicts', 'is_counterexample_to', 'qualifies',
+  ]);
+  cy.edges().forEach(e => {
+    const t = e.data('type');
+    if (counterTypes.has(t)) {
+      edges.add(e.id());
+      nodes.add(e.data('source'));
+      nodes.add(e.data('target'));
+    }
+  });
+}
+
+function computeUnrenderableClusters(nodes, edges) {
+  const unrenderableClusterIds = new Set();
+  (data.clusters || []).forEach(c => {
+    if (c.has_unrenderable_marker) unrenderableClusterIds.add(c.id);
+  });
+  cy.nodes().forEach(n => {
+    if (n.data('hasUnrenderableMarker')) nodes.add(n.id());
+    const cid = n.data('clusterId');
+    if (cid && unrenderableClusterIds.has(cid)) nodes.add(n.id());
+  });
+  // Highlight every edge between two flagged claims.
+  cy.edges().forEach(e => {
+    if (nodes.has(e.data('source')) && nodes.has(e.data('target'))) {
+      edges.add(e.id());
+    }
+  });
+}
+
+// Wire the sidebar mode picker.
+document.getElementById('map-mode-picker').addEventListener('change', evt => {
+  applyMapMode(evt.target.value);
+});
+
+// On startup, honour ?mode=... from the URL (the cockpit drives the
+// mode this way).
+(function initMapMode() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const initial = params.get('mode') || (data.meta && data.meta.mode) || 'default';
+    applyMapMode(initial);
+  } catch (e) {
+    applyMapMode('default');
+  }
+})();
+
+// ── Phase 6 — postMessage selection sync ────────────────────
+//
+// The cockpit hosts this graph via an iframe. We accept two message
+// kinds from the parent:
+//   {type: 'set-mode', mode: '...'}      → switch overlay
+//   {type: 'select-claim', claim_id}     → highlight a specific claim
+// And we post one message kind upward when the user taps a node:
+//   {type: 'lattice:node-tapped', node_id, kind, section_id, cluster_id}
+window.addEventListener('message', evt => {
+  const msg = evt.data;
+  if (!msg || typeof msg !== 'object') return;
+  if (msg.type === 'lattice:set-mode' && typeof msg.mode === 'string') {
+    applyMapMode(msg.mode);
+  } else if (msg.type === 'lattice:select-claim' && typeof msg.claim_id === 'string') {
+    highlightClaimFromParent(msg.claim_id);
+  }
+});
+
+let externallySelectedClaimId = null;
+function highlightClaimFromParent(claimId) {
+  externallySelectedClaimId = claimId;
+  cy.batch(() => {
+    cy.nodes().removeClass('selected-from-parent');
+    const node = cy.getElementById(claimId);
+    if (node && node.length) {
+      node.addClass('selected-from-parent');
+      // Center on the selected node so the user can find it visually.
+      try { cy.center(node); } catch (e) { /* ignore */ }
+    }
+  });
+}
+
+cy.on('tap', 'node', evt => {
+  const d = evt.target.data();
+  // Only post claim-level taps upward — section/cluster compound
+  // taps would clutter the cockpit's selection model.
+  if (d.type === 'section' || d.type === 'cluster') return;
+  try {
+    window.parent.postMessage({
+      type: 'lattice:node-tapped',
+      node_id: d.id,
+      kind: d.type,
+      section_id: d.sectionId || null,
+      cluster_id: d.clusterId || null,
+    }, '*');
+  } catch (e) { /* same-origin only when iframed */ }
 });
 </script>
 </body>

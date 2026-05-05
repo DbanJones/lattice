@@ -23,6 +23,8 @@ from .models import (
     EditProposal,
     Relationship,
     Section,
+    Snapshot,
+    SnapshotKind,
     Source,
 )
 
@@ -46,6 +48,10 @@ class GraphStore:
         self.flag_decisions_path = self.lattice_dir / "flag_decisions.json"
         self.edit_decisions_path = self.lattice_dir / "edit_decisions.json"
         self.runs_dir = self.lattice_dir / "runs"
+        # Phase 7 — provenance + versioning. Bundled snapshots of the
+        # full project state (graph, clusters, sources, audit flags)
+        # taken before each major mutation, restorable as a unit.
+        self.snapshots_dir = self.lattice_dir / "snapshots"
 
     @classmethod
     def load(cls, project_path: Path) -> "GraphStore":
@@ -357,6 +363,153 @@ class GraphStore:
             log = self._read_json(path)
         log.append(entry)
         self._atomic_write_text(path, json.dumps(log, indent=2))
+
+    # ─── Snapshots (Phase 7) ─────────────────────────────
+
+    def create_snapshot(
+        self,
+        kind: SnapshotKind = SnapshotKind.manual,
+        *,
+        actor: str = "user",
+        message: str = "",
+    ) -> Snapshot:
+        """Capture the current project state as a single bundled
+        snapshot and persist it to ``.lattice/snapshots/``.
+
+        The bundle is restorable as a unit via ``revert_to_snapshot``.
+        Snapshots are cheap-to-take but not free; the activity
+        dispatcher creates one per major activity rather than per
+        individual ``save_*`` call.
+        """
+        self.snapshots_dir.mkdir(parents=True, exist_ok=True)
+        now = _utcnow()
+        # Stable, sortable snapshot ID. Microsecond suffix prevents
+        # collisions when two snapshots are taken in the same second
+        # (e.g. dispatcher snapshot followed by pre-revert snapshot).
+        stamp = now.strftime("%Y%m%dT%H%M%S")
+        snapshot_id = f"snap.{stamp}.{now.microsecond:06d}.{kind.value}"
+
+        graph: AuthorGraph | None = None
+        if self.author_graph_path.exists():
+            graph = self.get_graph()
+        clusters = self._load_clusters()
+        sources = self.list_sources()
+
+        audit_flags: dict[str, list[AuditFlag]] = {}
+        if self.audit_flags_path.exists():
+            try:
+                raw = self._read_json(self.audit_flags_path)
+                if isinstance(raw, dict):
+                    for voice, flags in raw.items():
+                        if isinstance(flags, list):
+                            audit_flags[voice] = [
+                                AuditFlag.model_validate(f) for f in flags
+                                if isinstance(f, dict)
+                            ]
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        snapshot = Snapshot(
+            snapshot_id=snapshot_id,
+            kind=kind,
+            created_at=now,
+            actor=actor,
+            message=message,
+            graph=graph,
+            clusters=clusters,
+            sources=sources,
+            audit_flags=audit_flags,
+        )
+        target = self.snapshots_dir / f"{snapshot_id}.json"
+        self._atomic_write_text(target, snapshot.model_dump_json(indent=2))
+        return snapshot
+
+    def list_snapshots(self) -> list[Snapshot]:
+        """Return every snapshot, newest first. Robust to partial
+        files: a malformed snapshot is skipped rather than blowing
+        up the whole listing."""
+        if not self.snapshots_dir.exists():
+            return []
+        out: list[Snapshot] = []
+        for path in self.snapshots_dir.glob("*.json"):
+            try:
+                out.append(Snapshot.model_validate_json(
+                    path.read_text(encoding="utf-8")
+                ))
+            except Exception:  # pragma: no cover — corrupt-file resilience
+                continue
+        out.sort(key=lambda s: s.created_at, reverse=True)
+        return out
+
+    def load_snapshot(self, snapshot_id: str) -> Snapshot:
+        target = self.snapshots_dir / f"{snapshot_id}.json"
+        if not target.exists():
+            raise KeyError(f"Snapshot not found: {snapshot_id}")
+        return Snapshot.model_validate_json(
+            target.read_text(encoding="utf-8")
+        )
+
+    def revert_to_snapshot(
+        self, snapshot_id: str, *, take_pre_revert: bool = True,
+    ) -> Snapshot:
+        """Restore project state from a snapshot.
+
+        Writes the embedded graph, clusters, sources, and audit
+        flags back to their canonical paths. By default, takes a
+        ``pre_revert`` snapshot first so the revert itself is
+        recoverable (set ``take_pre_revert=False`` only when called
+        from inside an automatic-revert flow that already snapshotted).
+        Returns the restored snapshot.
+        """
+        snapshot = self.load_snapshot(snapshot_id)
+        if take_pre_revert:
+            self.create_snapshot(
+                kind=SnapshotKind.pre_revert,
+                actor="system",
+                message=f"Pre-revert snapshot before restoring {snapshot_id}",
+            )
+        # Restore each artefact type. Missing entries in the snapshot
+        # mean "this didn't exist when snapshotted" — clear the
+        # canonical path rather than leaving stale state behind.
+        if snapshot.graph is not None:
+            self._atomic_write_text(
+                self.author_graph_path,
+                snapshot.graph.model_dump_json(indent=2),
+            )
+        elif self.author_graph_path.exists():
+            self.author_graph_path.unlink()
+
+        if snapshot.clusters:
+            payload = json.dumps(
+                {"clusters": [c.model_dump(mode="json") for c in snapshot.clusters]},
+                indent=2,
+            )
+            self._atomic_write_text(self.cluster_plan_path, payload)
+        elif self.cluster_plan_path.exists():
+            self.cluster_plan_path.unlink()
+
+        if snapshot.sources:
+            payload = json.dumps(
+                {"sources": [s.model_dump(mode="json") for s in snapshot.sources]},
+                indent=2,
+            )
+            self._atomic_write_text(self.source_store_path, payload)
+        elif self.source_store_path.exists():
+            self.source_store_path.unlink()
+
+        if snapshot.audit_flags:
+            payload = json.dumps(
+                {
+                    voice: [f.model_dump(mode="json") for f in flags]
+                    for voice, flags in snapshot.audit_flags.items()
+                },
+                indent=2,
+            )
+            self._atomic_write_text(self.audit_flags_path, payload)
+        elif self.audit_flags_path.exists():
+            self.audit_flags_path.unlink()
+
+        return snapshot
 
     # ─── Token tracking ──────────────────────────────────
 

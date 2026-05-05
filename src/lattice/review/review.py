@@ -19,6 +19,7 @@ track-changes paper (also rendered in the UI).
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -26,7 +27,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from ..graph.models import AuthorGraph, Cluster
+from ..graph.models import (
+    AuthorGraph, Cluster, ProposalKind, ProposalStatus, ReviewProposal,
+)
 from ..graph.store import GraphStore
 from ..utils.llm import ClaudeClient
 
@@ -54,6 +57,14 @@ class ReviewReport(BaseModel):
     overall_critique: str = ""
     section_critiques: list[SectionCritique] = Field(default_factory=list)
     cluster_revisions: list[ClusterRevision] = Field(default_factory=list)
+    # Phase 5: typed graph-aware proposals derived from the cluster
+    # revisions. Each proposal lists the claim, source, and
+    # relationship IDs it affects so the cockpit can resolve a
+    # meaningful selection on click and the (Phase 7) apply pipeline
+    # has a clean audit trail. ``cluster_revisions`` stays the canonical
+    # human-readable diff format; ``proposals`` is the structured
+    # accept/reject queue.
+    proposals: list[ReviewProposal] = Field(default_factory=list)
     mode: Literal["fast", "thorough"] = "thorough"
 
 
@@ -220,6 +231,102 @@ async def _critique_overall(
 # ─── word-level diff rendering ───────────────────
 
 
+# ─── proposal derivation (Phase 5) ───────────────
+
+
+# Lightweight kind detection from the supervisor's comment text.
+# Each proposal must carry a ``kind``; we infer it from keywords the
+# supervisor uses so the cockpit can filter sensibly. The renderer
+# could be re-prompted to label proposals directly, but this avoids
+# re-running every cluster revision call.
+_KIND_KEYWORDS: tuple[tuple[ProposalKind, tuple[str, ...]], ...] = (
+    (ProposalKind.mechanism, ("mechanism", "causal", "because", "explain how")),
+    (ProposalKind.citation, ("cite", "citation", "engage", "source", "reference")),
+    (ProposalKind.precision, ("vague", "specific", "imprecise", "exactly")),
+    (ProposalKind.logic, ("logic", "follow", "connector", "implication", "conclu")),
+    (ProposalKind.voice, ("voice", "hedge", "register", "formal", "tone")),
+    (ProposalKind.clarity, ("tighten", "clarify", "clarity", "meander", "wordy")),
+)
+
+
+def _classify_proposal_kind(comment: str) -> ProposalKind:
+    text = (comment or "").lower()
+    for kind, keywords in _KIND_KEYWORDS:
+        if any(kw in text for kw in keywords):
+            return kind
+    return ProposalKind.other
+
+
+def _derive_proposal(
+    revision: ClusterRevision, cluster: Cluster | None,
+) -> ReviewProposal:
+    """Map a ClusterRevision onto a graph-aware ReviewProposal.
+
+    Affects:
+      - every claim in the cluster's claim_sequence (the rewrite
+        touches all of them by construction)
+      - every distinct source bound to those claims (if available)
+      - the cluster's relationship_context relationship IDs
+    """
+    affects_claim_ids: list[str] = []
+    affects_source_ids: list[str] = []
+    affects_relationship_ids: list[str] = []
+    if cluster is not None:
+        affects_claim_ids = [e.claim_id for e in cluster.claim_sequence]
+        rels = getattr(cluster, "relationship_context", None) or []
+        for r in rels:
+            rid = getattr(r, "rel_id", None) or getattr(r, "id", None)
+            if rid:
+                affects_relationship_ids.append(str(rid))
+
+    # Stable proposal ID: cluster + content hash. Stable enough that
+    # re-running the review pass on identical inputs produces the
+    # same proposal_id, so accept/reject decisions persist across
+    # re-runs.
+    digest = re.sub(
+        r"[^A-Za-z0-9]+",
+        "_",
+        f"{revision.cluster_id}:{revision.original_prose[:80]}:{revision.revised_prose[:80]}",
+    )[:80]
+    return ReviewProposal(
+        proposal_id=f"prop.{digest}",
+        kind=_classify_proposal_kind(revision.comment),
+        cluster_id=revision.cluster_id,
+        section_id=revision.section_id,
+        affects_claim_ids=affects_claim_ids,
+        affects_source_ids=affects_source_ids,
+        affects_relationship_ids=affects_relationship_ids,
+        before_text=revision.original_prose,
+        after_text=revision.revised_prose,
+        comment=revision.comment,
+        severity=revision.severity,
+        status=ProposalStatus.pending,
+    )
+
+
+def _attach_source_ids(
+    proposals: list[ReviewProposal], graph: AuthorGraph,
+) -> None:
+    """Fill each proposal's ``affects_source_ids`` from its claims'
+    bound evidence. Mutates in place so ``produce_review`` can run it
+    once and avoid re-walking the graph on every proposal."""
+    sources_by_claim: dict[str, list[str]] = {}
+    for claim in graph.claims:
+        sids: list[str] = []
+        for ev in claim.evidence:
+            if ev.source and ev.source not in sids:
+                sids.append(ev.source)
+        if sids:
+            sources_by_claim[claim.claim_id] = sids
+    for p in proposals:
+        seen: list[str] = []
+        for cid in p.affects_claim_ids:
+            for sid in sources_by_claim.get(cid, []):
+                if sid not in seen:
+                    seen.append(sid)
+        p.affects_source_ids = seen
+
+
 def _word_diff_html(original: str, revised: str) -> str:
     """Return ``original`` with word-level ``<del>``/``<ins>`` markup
     showing how it changes into ``revised``. Markdown renders these
@@ -339,6 +446,14 @@ async def produce_review(
         if progress:
             progress.end("review_overall", status="overall critique done")
 
+    # Phase 5: derive structured proposals from the cluster revisions.
+    cluster_by_id = {c.cluster_id: c for c in clusters}
+    proposals = [
+        _derive_proposal(r, cluster_by_id.get(r.cluster_id))
+        for r in revisions
+    ]
+    _attach_source_ids(proposals, graph)
+
     return ReviewReport(
         project_name=graph.project_name or project_path.name,
         voice_name=voice_name,
@@ -346,6 +461,7 @@ async def produce_review(
         overall_critique=overall_critique,
         section_critiques=section_critiques,
         cluster_revisions=revisions,
+        proposals=proposals,
         mode=mode,
     )
 

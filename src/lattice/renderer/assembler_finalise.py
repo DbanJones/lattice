@@ -119,6 +119,14 @@ class DocumentFinaliser:
                     lines.append("")
                     continue
                 prose = prose_path.read_text(encoding="utf-8").rstrip()
+                # Phase 6 follow-up: emit a cluster-boundary HTML comment
+                # before each cluster's prose. Markdown renderers ignore
+                # comments, so this is invisible in rendered output but
+                # gives the cockpit a stable anchor to bind paragraphs
+                # to (cluster_id, section_id) for paper↔map selection.
+                lines.append(
+                    f"<!-- lattice:cluster {cluster.cluster_id} {section.section_id} -->"
+                )
                 lines.append(prose)
                 lines.append("")
 
@@ -143,4 +151,12 @@ class DocumentFinaliser:
         block_path = self.project_path / ".lattice" / "delivery_blocked.md"
         if block_path.exists():
             block_path.unlink()
+        # Phase 4: emit a paragraph trace report alongside the paper.
+        # Best-effort — finalisation succeeded so we don't want a trace
+        # error to mask delivery success.
+        try:
+            from .trace import regenerate_traces
+            regenerate_traces(self.project_path, self.store, self.voice.name)
+        except Exception:  # pragma: no cover — non-essential
+            pass
         return out_path

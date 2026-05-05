@@ -946,70 +946,6 @@ code:not(.path-pill) {
 
 /* ─── run form ─── */
 
-.run-form { display: grid; gap: 16px; }
-
-.level-options {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 10px;
-  margin-top: 12px;
-}
-
-.level-option { cursor: pointer; }
-.level-option input { display: none; }
-
-.level-card {
-  display: block;
-  padding: 14px 16px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--surface);
-  transition: all 0.12s;
-  height: 100%;
-}
-
-.level-option input:checked + .level-card {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-  box-shadow: 0 0 0 3px rgba(29, 78, 216, 0.1);
-}
-
-.level-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  margin-bottom: 4px;
-}
-
-.level-name { font-weight: 600; font-size: 14px; }
-.level-time { font-size: 11px; color: var(--muted); font-family: var(--font-mono); }
-
-.level-desc {
-  margin: 0 0 8px;
-  font-size: 12px;
-  color: var(--muted);
-  line-height: 1.4;
-}
-
-.level-features {
-  display: flex;
-  gap: 4px;
-  flex-wrap: wrap;
-}
-
-.level-features span {
-  font-size: 10px;
-  padding: 1px 6px;
-  background: var(--surface-3);
-  color: var(--muted);
-  border-radius: 3px;
-}
-
-.level-option input:checked + .level-card .level-features span {
-  background: rgba(29, 78, 216, 0.08);
-  color: var(--accent);
-}
-
 .advanced summary {
   cursor: pointer;
   font-weight: 600;
@@ -2113,56 +2049,6 @@ code:not(.path-pill) {
   flex-wrap: wrap;
   margin-top: 12px;
 }
-
-/* ─── Review tab: level progression banner + completed badges ─── */
-.progression-banner {
-  border-left: 3px solid var(--accent);
-  background: linear-gradient(90deg, rgba(59, 130, 246, 0.04) 0%, transparent 60%);
-  margin-bottom: 16px;
-}
-.progression-row {
-  display: flex;
-  gap: 16px;
-  flex-wrap: wrap;
-  margin-top: 8px;
-}
-.progression-stage {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-  flex: 1 1 200px;
-}
-.progression-stage.done {
-  background: #ecfdf5;
-  border-color: #a7f3d0;
-}
-.progression-stage .dot {
-  width: 10px; height: 10px; border-radius: 50%;
-  flex-shrink: 0;
-}
-.progression-stage .dot.ok { background: var(--ok); }
-.progression-stage .dot.muted { background: var(--muted-2); }
-.stage-info { display: flex; flex-direction: column; }
-
-.level-completed-badge {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px solid var(--border);
-  font-size: 11px;
-  color: var(--muted);
-}
-.level-completed-badge .dot {
-  width: 6px; height: 6px; border-radius: 50%;
-}
-.level-completed-badge .dot.ok { background: var(--ok); }
-.level-completed-badge .dot.bad { background: var(--bad); }
 
 /* ─── Quality (audit + reviews) sub-tabs ─── */
 .quality-tabs {
@@ -3400,3 +3286,292 @@ code:not(.path-pill) {
 .heatmap-note-block strong { color: var(--accent, #3b82f6); }
 .heatmap-note-block ul { margin: 6px 0 0; padding-left: 18px; }
 .heatmap-note-block li { line-height: 1.4; margin: 3px 0; }
+
+/* ─── Revision Cockpit (Phase 3) ────────────────────────────
+   Four-pane working surface: paper preview (top-left), argument
+   map (top-right), issues queue (bottom-left), evidence/claim
+   inspector (bottom-right). Selecting a claim or queue item
+   syncs all four panes via cockpit.js's selection model.
+   ─────────────────────────────────────────────────────────── */
+
+.cockpit {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  grid-template-rows: minmax(280px, 1fr) minmax(280px, 1fr);
+  gap: 12px;
+  height: calc(100vh - 220px);
+  min-height: 640px;
+}
+
+.cockpit-pane {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.cockpit-pane-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  font-size: 12px;
+}
+
+.cockpit-pane-head h4 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text);
+  text-transform: uppercase;
+}
+
+.cockpit-pane-body {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 12px;
+  font-size: 13px;
+  min-height: 0;
+}
+
+.cockpit-pane-body.no-padding { padding: 0; }
+
+.cockpit-pane-body.empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-style: italic;
+  font-size: 12px;
+  padding: 24px;
+  text-align: center;
+}
+
+/* Layout regions. */
+.cockpit-pane.paper   { grid-column: 1; grid-row: 1; }
+.cockpit-pane.map     { grid-column: 2; grid-row: 1; }
+.cockpit-pane.queue   { grid-column: 1; grid-row: 2; }
+.cockpit-pane.evidence{ grid-column: 2; grid-row: 2; }
+
+/* Paper preview pane: rendered prose, scrollable. */
+.cockpit-paper {
+  font-family: 'Inter', -apple-system, system-ui, sans-serif;
+  line-height: 1.55;
+  font-size: 13px;
+}
+.cockpit-paper h1 { font-size: 18px; margin: 12px 0 6px; }
+.cockpit-paper h2 { font-size: 15px; margin: 12px 0 6px; }
+.cockpit-paper h3 { font-size: 13px; margin: 10px 0 4px; color: var(--muted); }
+.cockpit-paper p  { margin: 0 0 8px; }
+.cockpit-paper .cockpit-paragraph[data-cluster-id] {
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 4px 6px;
+  transition: background 0.1s;
+}
+.cockpit-paper .cockpit-paragraph[data-cluster-id]:hover {
+  background: var(--surface-hover);
+}
+.cockpit-paper .cockpit-paragraph.selected {
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+/* Argument map pane: cytoscape iframe in a tight box. */
+.cockpit-pane.map .cockpit-pane-body { padding: 0; }
+.cockpit-pane.map iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+/* Queue list. */
+.cockpit-queue-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  font-size: 11px;
+}
+.cockpit-queue-toolbar button {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: inherit;
+  color: var(--text-2);
+}
+.cockpit-queue-toolbar button.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-hover);
+}
+.cockpit-queue-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.cockpit-queue-item {
+  display: grid;
+  grid-template-columns: 8px 1fr auto;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  align-items: start;
+  transition: background 0.1s;
+}
+.cockpit-queue-item:hover { background: var(--surface-hover); }
+.cockpit-queue-item.selected {
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.cockpit-queue-item .severity-stripe {
+  width: 8px;
+  border-radius: 2px;
+  align-self: stretch;
+}
+.cockpit-queue-item.severity-critical .severity-stripe { background: #dc2626; }
+.cockpit-queue-item.severity-standard .severity-stripe { background: #f59e0b; }
+.cockpit-queue-item.severity-minor    .severity-stripe { background: #94a3b8; }
+.cockpit-queue-item.severity-info     .severity-stripe { background: #3b82f6; }
+.cockpit-queue-item .item-title {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text);
+}
+.cockpit-queue-item .item-body {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+  margin-top: 2px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.cockpit-queue-item .item-meta {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+.cockpit-queue-item .item-kind {
+  font-size: 10px;
+  color: var(--muted-2);
+  font-family: var(--font-mono);
+}
+
+/* Evidence + claim inspector pane. */
+.cockpit-claim-block {
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px dashed var(--border);
+}
+.cockpit-claim-block:last-child { border-bottom: 0; margin-bottom: 0; }
+.cockpit-claim-statement {
+  font-weight: 600;
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0 0 6px;
+}
+.cockpit-claim-meta {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.cockpit-claim-meta .pill { font-size: 10px; padding: 1px 6px; }
+.cockpit-claim-paragraph {
+  background: var(--surface-2);
+  border-left: 3px solid var(--accent);
+  padding: 8px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 8px 0;
+  white-space: pre-wrap;
+}
+.cockpit-evidence-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  padding: 4px 0;
+  font-size: 12px;
+  border-bottom: 1px dotted var(--border);
+}
+.cockpit-evidence-row:last-child { border-bottom: 0; }
+.cockpit-action-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+.cockpit-action-row button {
+  font-size: 11px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.cockpit-action-row button:hover {
+  border-color: var(--accent);
+  color: var(--accent-hover);
+}
+.cockpit-action-row button.primary {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+.cockpit-action-row button.primary:hover { background: var(--accent-hover); }
+
+.cockpit-toast {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 10px 14px;
+  font-size: 12px;
+  max-width: 360px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.08);
+  z-index: 100;
+  animation: cockpit-toast-in 0.16s ease-out;
+}
+@keyframes cockpit-toast-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Output tab — make the legacy panel toggle clearly secondary. */
+.cockpit-legacy-toggle {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 4px 8px;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  background: transparent;
+}
+.cockpit-legacy-toggle:hover { color: var(--accent); border-color: var(--accent); }
+
