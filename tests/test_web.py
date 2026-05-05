@@ -1303,6 +1303,226 @@ def test_graph_viz_regenerates_when_audit_dir_changes(
     )
 
 
+def test_graph_viz_detects_unrenderable_marker_under_voice_subdir(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """The visualiser's marker scan must look at the voice-specific
+    drafts subdirectory. The renderer writes
+    ``.lattice/drafts/<voice>/cluster_*.md`` — reading the flat
+    ``.lattice/drafts/`` directory always missed the marker.
+    """
+    project = tmp_path / "demo"
+    drafts_voice_dir = project / ".lattice" / "drafts" / "academic"
+    drafts_voice_dir.mkdir(parents=True, exist_ok=True)
+    (drafts_voice_dir / "cluster_c.x.1.md").write_text(
+        'Some prose. {CLUSTER_UNRENDERABLE: cluster_id="c.x.1", '
+        'reason="no bindings"}',
+        encoding="utf-8",
+    )
+
+    resp = client.get("/api/projects/demo/graph-viz")
+    assert resp.status_code == 200
+    body = resp.text
+    assert '"hasUnrenderableMarker": true' in body or '"hasUnrenderableMarker":true' in body
+
+
+def test_graph_viz_uses_local_cytoscape_not_unpkg(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """The web-served graph HTML must reference the vendored
+    cytoscape.min.js so the UI works offline."""
+    resp = client.get("/api/projects/demo/graph-viz")
+    assert resp.status_code == 200
+    body = resp.text
+    assert "/static/vendor/cytoscape/cytoscape.min.js" in body
+    assert "unpkg.com" not in body
+
+
+def test_graph_viz_regenerates_when_voice_drafts_change(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Touching a cluster file under the active voice's drafts
+    directory should invalidate the cached HTML so missing-claim and
+    unrenderable markers refresh after a re-render."""
+    import os as _os, time as _time
+    project = tmp_path / "demo"
+    viz_path = project / "outputs" / "argument_graph.html"
+    drafts_voice_dir = project / ".lattice" / "drafts" / "academic"
+    drafts_voice_dir.mkdir(parents=True, exist_ok=True)
+    cluster_md = drafts_voice_dir / "cluster_c.x.1.md"
+    cluster_md.write_text("clean prose, no markers", encoding="utf-8")
+
+    resp1 = client.get("/api/projects/demo/graph-viz")
+    assert resp1.status_code == 200
+    first_mtime = viz_path.stat().st_mtime
+
+    # Re-write the cluster file with an unrenderable marker, future-stamped.
+    cluster_md.write_text(
+        'prose. {CLUSTER_UNRENDERABLE: cluster_id="c.x.1", reason="x"}',
+        encoding="utf-8",
+    )
+    new_t = _time.time() + 10
+    _os.utime(cluster_md, (new_t, new_t))
+
+    resp2 = client.get("/api/projects/demo/graph-viz")
+    assert resp2.status_code == 200
+    assert viz_path.stat().st_mtime > first_mtime, (
+        "graph-viz should regenerate when a voice's draft file changes"
+    )
+    body2 = resp2.text
+    assert '"hasUnrenderableMarker": true' in body2 or '"hasUnrenderableMarker":true' in body2
+
+
+def test_cockpit_queue_returns_empty_when_nothing_run(client: TestClient) -> None:
+    """Fresh project: no audit, no lit gaps, no restructure, no review.
+    The endpoint should still respond 200 with an empty items list and
+    a sources map saying everything is missing."""
+    resp = client.get("/api/projects/demo/cockpit-queue")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["items"] == []
+    assert data["voice"] == "academic"
+    assert data["sources"] == {
+        "audit": "missing", "lit_gaps": "missing",
+        "restructure": "missing", "review": "missing",
+    }
+    assert data["counts"]["total"] == 0
+
+
+def test_cockpit_queue_merges_audit_lit_gaps_and_review(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Drop one audit flag, one lit-gap suggestion, and one review
+    revision into the project. The queue should surface all three with
+    the right targets, severities, and action sets."""
+    project = tmp_path / "demo"
+    lattice_dir = project / ".lattice"
+    outputs_dir = project / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    audit_path = lattice_dir / "audit_flags.json"
+    audit_path.write_text(json.dumps({
+        "academic": [{
+            "flag_id": "f.1",
+            "rule_id": "voice.hedge.weak",
+            "category": "voice",
+            "severity": "critical",
+            "cluster_id": "c.x.1",
+            "section_id": "s.x",
+            "offending_text": "may possibly perhaps",
+            "suggestion": "tighten",
+        }],
+    }), encoding="utf-8")
+
+    gaps_path = outputs_dir / "lit_gaps.academic.json"
+    gaps_path.write_text(json.dumps({
+        "project_name": "demo", "voice_name": "academic",
+        "generated_at": "2026-05-05T00:00:00Z", "mode": "thorough",
+        "total_suggestions": 1, "verified_count": 0,
+        "sections": [{
+            "section_id": "s.x", "section_title": "X",
+            "suggestions": [{
+                "author": "Smith", "year": 2020, "work": "Important paper",
+                "why_relevant": "directly bears on cl.x.1",
+                "claim_ids": ["cl.x.1"], "kind": "canonical",
+                "confidence": "high",
+            }],
+        }],
+    }), encoding="utf-8")
+
+    review_path = outputs_dir / "review.academic.json"
+    review_path.write_text(json.dumps({
+        "project_name": "demo", "voice_name": "academic",
+        "generated_at": "2026-05-05T00:00:00Z", "mode": "thorough",
+        "overall_critique": "needs work",
+        "section_critiques": [],
+        "cluster_revisions": [{
+            "cluster_id": "c.x.1", "section_id": "s.x", "section_title": "X",
+            "original_prose": "old", "revised_prose": "new",
+            "comment": "tighten this opening",
+            "severity": "concern",
+        }],
+    }), encoding="utf-8")
+
+    resp = client.get("/api/projects/demo/cockpit-queue")
+    assert resp.status_code == 200
+    data = resp.json()
+    kinds = sorted({it["kind"] for it in data["items"]})
+    assert kinds == ["audit_flag", "lit_gap", "review_proposal"]
+
+    # Ordering: critical audit + concern review (mapped to critical) come first.
+    assert data["items"][0]["severity"] == "critical"
+    # Lit gap targets the right claim.
+    lit = next(it for it in data["items"] if it["kind"] == "lit_gap")
+    assert lit["target_claim_id"] == "cl.x.1"
+    assert lit["target_section_id"] == "s.x"
+    assert "add-source" in lit["actions"]
+
+    assert data["sources"]["audit"] == "present"
+    assert data["sources"]["lit_gaps"] == "present"
+    assert data["sources"]["review"] == "present"
+    assert data["sources"]["restructure"] == "missing"
+
+
+def test_cockpit_claim_returns_claim_section_cluster_and_flags(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """The cockpit-claim endpoint should return the union of claim,
+    section, cluster, rendered paragraph, and audit flags."""
+    project = tmp_path / "demo"
+    drafts_dir = project / ".lattice" / "drafts" / "academic"
+    drafts_dir.mkdir(parents=True, exist_ok=True)
+    (drafts_dir / "cluster_c.x.1.md").write_text(
+        "Rendered paragraph text.", encoding="utf-8")
+
+    audit_path = project / ".lattice" / "audit_flags.json"
+    audit_path.write_text(json.dumps({
+        "academic": [{
+            "flag_id": "f.1", "rule_id": "r.1", "category": "voice",
+            "severity": "standard", "cluster_id": "c.x.1",
+            "section_id": "s.x", "offending_text": "x", "suggestion": "y",
+        }],
+    }), encoding="utf-8")
+
+    resp = client.get("/api/projects/demo/cockpit-claim/cl.x.1")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["claim"]["claim_id"] == "cl.x.1"
+    assert data["section"]["section_id"] == "s.x"
+    assert data["cluster"]["cluster_id"] == "c.x.1"
+    assert data["rendered_paragraph"] == "Rendered paragraph text."
+    assert len(data["audit_flags"]) == 1
+    assert "redraft-cluster" in data["available_actions"]
+
+
+def test_cockpit_claim_404_for_unknown_claim(client: TestClient) -> None:
+    resp = client.get("/api/projects/demo/cockpit-claim/cl.does.not.exist")
+    assert resp.status_code == 404
+
+
+def test_cockpit_action_endpoint_returns_501_with_structured_body(
+    client: TestClient,
+) -> None:
+    """Phase 3 stub: action routes exist and return 501 with a body
+    pointing at the phase that lands real behaviour. The frontend
+    relies on the structured detail payload to show a useful toast."""
+    resp = client.post(
+        "/api/projects/demo/cockpit/actions/redraft-cluster",
+        json={"claim_id": "cl.x.1", "cluster_id": "c.x.1"},
+    )
+    assert resp.status_code == 501
+    detail = resp.json()["detail"]
+    assert detail["status"] == "not_implemented"
+    assert detail["action"] == "redraft-cluster"
+    assert "Phase" in detail["next_phase"]
+
+
+def test_cockpit_action_rejects_unknown_action(client: TestClient) -> None:
+    resp = client.post("/api/projects/demo/cockpit/actions/nuke-everything",
+                       json={})
+    assert resp.status_code == 400
+
+
 def test_harvard_bibliography_includes_doi_url() -> None:
     """The bibliography string should embed a https://doi.org/...
     URL when a DOI is present, so the frontend's autolink regex

@@ -1,6 +1,23 @@
-"""Pipeline runner that streams progress events to a queue.
+"""Pipeline runner — legacy quick/standard/deep entry point.
 
-Implements the three review levels exposed by the web UI:
+.. deprecated::
+   The "review levels" (quick / standard / deep) implemented here have
+   been superseded by the verb-oriented activity model in
+   :mod:`lattice.web.activities` (ingest, scaffold, draft, find_gaps,
+   refine, restructure, review). The frontend no longer offers
+   quick/standard/deep as user-facing options.
+
+   This module is retained because:
+
+   1. ``EventQueueProgress``, ``RunResult``, and
+      :func:`capture_project_state` are imported by ``activities.py``.
+   2. ``record_run_history`` and ``read_run_history`` continue to read
+      and write ``.lattice/run_history.json`` for projects that have
+      pre-activity records.
+   3. The legacy ``POST /api/projects/{name}/runs`` endpoint still
+      accepts level-based requests for any external callers.
+
+The legacy review levels were:
 
 - **quick**     — render only (no autocorrect, no audit, no convergence)
 - **standard**  — render + audit + voice review (single pass, no autofix)

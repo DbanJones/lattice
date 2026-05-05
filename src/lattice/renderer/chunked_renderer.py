@@ -40,7 +40,9 @@ from ..graph.models import (
     Claim,
     ClaimType,
     Cluster,
+    MechanismSupport,
     ProseState,
+    RedraftMode,
     Section,
     Source,
     TokenCount,
@@ -55,6 +57,89 @@ from .cluster_renderer import (
     RenderabilityAssessment,
     validate_response,
 )
+
+
+def classify_mechanism_support(claim: Claim) -> MechanismSupport:
+    """Decide how a claim's mechanism is grounded.
+
+    Pure function over the claim's evidence + author_origin flag.
+    Drives the renderer's mechanism-discipline prompt rule and the
+    coverage / audit checks downstream. See Phase 5 plan.
+    """
+    if not claim.mechanism or not claim.mechanism.strip():
+        return MechanismSupport.none
+    has_strong_evidence = any(
+        ev.binding_strength == BindingStrength.strong for ev in claim.evidence
+    )
+    if has_strong_evidence:
+        return MechanismSupport.source_supported
+    if claim.author_origin or claim.type == ClaimType.user_synthesis:
+        return MechanismSupport.author_specified
+    return MechanismSupport.unknown
+
+
+_MECHANISM_DISCIPLINE_RULES = (
+    "MECHANISM DISCIPLINE (Phase 5):\n"
+    "- A claim's mechanism is annotated with a ``mechanism_support`` "
+    "attribute on its <claim> element. It takes one of four values:\n"
+    "    source_supported : at least one bound passage carries strong "
+    "evidence for the mechanism. Render it as fact, weave the source.\n"
+    "    author_specified : author-original claim with a stated "
+    "mechanism but no strong external evidence. Render it as the "
+    "author's own analytical move; voice's authorial first-person "
+    "rules apply.\n"
+    "    unknown          : a mechanism is stated but neither strong "
+    "evidence nor author origin backs it. DO NOT smooth this into "
+    "prose as if it were fact. Render the surrounding claim, and "
+    "where the mechanism would have been, emit:\n"
+    "      {UNRENDERABLE_MECHANISM: claim_id=\"<id>\", "
+    "description=\"<the mechanism text>\"}\n"
+    "    none             : claim has no stated mechanism — render "
+    "as you would any other claim.\n"
+    "- Never invent a causal/mechanistic link that isn't stated on "
+    "the claim. If the prose needs one to flow and none is supplied, "
+    "use a non-causal connector instead (\"alongside\", \"and\", "
+    "\"consistent with\") and let the audit decide.\n"
+)
+
+
+_REDRAFT_MODE_PRELUDES: dict[RedraftMode, str] = {
+    RedraftMode.conservative_polish: (
+        "REDRAFT MODE: conservative_polish.\n"
+        "- Preserve every claim, citation, connector, and ordering.\n"
+        "- Tighten only sentence-level diction and rhythm.\n"
+        "- Do not reshape paragraph structure.\n"
+    ),
+    RedraftMode.argument_repair: (
+        "REDRAFT MODE: argument_repair.\n"
+        "- Logical flow is the priority. Rework sentence order if it "
+        "improves the reasoning move, but no claim may be dropped.\n"
+        "- Make implicit connectors explicit.\n"
+        "- Surface unstated assumptions as hedged authorial moves "
+        "rather than inserting unsupported claims.\n"
+    ),
+    RedraftMode.evidence_integration: (
+        "REDRAFT MODE: evidence_integration.\n"
+        "- Each citation should be engaged, not name-dropped.\n"
+        "- Prefer reporting verbs that signal stance (\"argues\", "
+        "\"demonstrates\", \"contests\") over neutral attribution.\n"
+        "- Where two or three sources cluster on the same point, "
+        "synthesise them in one sentence rather than listing.\n"
+    ),
+    RedraftMode.compression: (
+        "REDRAFT MODE: compression.\n"
+        "- Target the lower bound of the cluster's word range.\n"
+        "- Preserve every claim and citation. Drop redundancy only.\n"
+        "- Sentences that paraphrase the previous one are the first to go.\n"
+    ),
+    RedraftMode.expansion: (
+        "REDRAFT MODE: expansion.\n"
+        "- Target the upper bound of the cluster's word range.\n"
+        "- Develop each claim with the bound passage's actual content.\n"
+        "- Do not invent new claims; expand by engaging existing "
+        "evidence more deeply.\n"
+    ),
+}
 
 
 @dataclass
@@ -82,6 +167,7 @@ class ChunkedRenderer:
         # CLI flags if your model-stage budget is higher.
         min_chunk: int = 3,
         max_chunk: int = 4,
+        redraft_mode: RedraftMode | None = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -89,6 +175,10 @@ class ChunkedRenderer:
         self.voice = voice
         self.min_chunk = min_chunk
         self.max_chunk = max_chunk
+        # Phase 5: optional redraft mode that prepends a prelude to
+        # the system prompt. ``None`` keeps the original render
+        # behaviour for first-time renders.
+        self.redraft_mode = redraft_mode
         self._cluster_renderer = ClusterRenderer(config, store, llm, voice)
         self.drafts_dir = (
             config.project_path / ".lattice" / "drafts" / voice.name
@@ -315,7 +405,7 @@ class ChunkedRenderer:
         sections_by_id = {s.section_id: s for s in graph.sections}
 
         # System prompt: voice rules + chunked-render contract.
-        system = _build_chunked_system_prompt(self.voice)
+        system = _build_chunked_system_prompt(self.voice, self.redraft_mode)
 
         # User prompt: list every cluster in the chunk with full context,
         # plus the previous chunk's close for transition.
@@ -477,7 +567,72 @@ Hard constraints (also stated in the system turn):
 
 # ─── prompt builders (chunk-aware) ─────────────
 
-def _build_chunked_system_prompt(voice: Voice) -> str:
+# ─── claim-preservation check (Phase 5) ──────────────
+
+
+_CLAIM_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-]{3,}")
+_CLAIM_TOKEN_STOP = frozenset(
+    "the a an of in on at to for and or but with by from as is are was were "
+    "be been being have has had do does did this that these those it its "
+    "their there which who whose what whom how when where why".split()
+)
+
+
+def _claim_signature(text: str) -> set[str]:
+    """Return the set of distinctive content tokens in ``text``.
+    Used by ``verify_claims_preserved`` to decide whether a rewrite
+    has dropped a required claim. Lower-case, length>3, stop-word
+    filtered. Bias toward distinctive nouns + verbs."""
+    out: set[str] = set()
+    for m in _CLAIM_TOKEN_RE.finditer(text or ""):
+        tok = m.group(0).lower()
+        if tok not in _CLAIM_TOKEN_STOP:
+            out.add(tok)
+    return out
+
+
+def verify_claims_preserved(
+    cluster: Cluster,
+    prose: str,
+    claims_by_id: dict[str, Claim],
+    *,
+    min_overlap_ratio: float = 0.25,
+) -> list[str]:
+    """Return the list of claim IDs whose distinctive vocabulary is
+    no longer present in ``prose`` at the configured overlap ratio.
+
+    A claim is considered preserved when at least ``min_overlap_ratio``
+    of its distinctive content tokens appear (case-insensitive) in the
+    prose. The default 0.25 catches the case where a rewrite has
+    silently dropped a claim while staying loose enough to allow
+    paraphrase. Returning an empty list means every required claim's
+    fingerprint survived the rewrite — the contract Phase 5 is
+    enforcing.
+
+    Pure function — used by tests, by the auditor's coverage check,
+    and (in Phase 7) by the redraft pipeline to fail a rewrite that
+    drops claims.
+    """
+    prose_tokens = _claim_signature(prose)
+    dropped: list[str] = []
+    for entry in cluster.claim_sequence:
+        claim = claims_by_id.get(entry.claim_id)
+        if claim is None:
+            continue
+        sig = _claim_signature(claim.statement)
+        # Tiny-vocabulary claims (mostly stop words) can't be checked
+        # reliably; skip them rather than false-flag.
+        if len(sig) < 3:
+            continue
+        overlap = sig & prose_tokens
+        if len(overlap) / len(sig) < min_overlap_ratio:
+            dropped.append(claim.claim_id)
+    return dropped
+
+
+def _build_chunked_system_prompt(
+    voice: Voice, redraft_mode: RedraftMode | None = None,
+) -> str:
     voice_snapshot = {
         "name": voice.name,
         "register": voice.register.model_dump(),
@@ -496,7 +651,11 @@ def _build_chunked_system_prompt(voice: Voice) -> str:
         "prohibitions": voice.prohibitions,
         "preferences": voice.preferences,
     }
-    return f"""You render multiple consecutive clusters of an academic document
+    redraft_prelude = (
+        _REDRAFT_MODE_PRELUDES.get(redraft_mode, "")
+        if redraft_mode is not None else ""
+    )
+    return f"""{redraft_prelude}You render multiple consecutive clusters of an academic document
 as connected prose, applying a specific voice. The clusters share a
 narrative arc — your job is to render each one well *and* let them flow
 into each other within the chunk.
@@ -537,6 +696,8 @@ and emit a structured marker for the unbound ones, INLINE in that
 cluster's prose:
 
 {{MISSING_CLAIM: cluster_id="<id>", claim_id="<id>", description="<what was needed>"}}
+
+{_MECHANISM_DISCIPLINE_RULES}
 
 Output JSON only. No preamble. No trailing prose. The schema is:
 
@@ -589,8 +750,9 @@ def _format_cluster_block(
             )
         evidence_xml = "\n".join(evidence_parts) or "    (no evidence bound)"
         reporting = (entry.reporting_verb or "n/a") if entry else "n/a"
+        mechanism_support = classify_mechanism_support(claim).value
         mechanism_block = (
-            f"    <mechanism>{claim.mechanism}</mechanism>\n"
+            f'    <mechanism support="{mechanism_support}">{claim.mechanism}</mechanism>\n'
             if (claim.mechanism and claim.mechanism.strip())
             else ""
         )
@@ -602,7 +764,8 @@ def _format_cluster_block(
             f'confidence="{claim.confidence.value}" reporting_verb="{reporting}" '
             f'grounded="{bound}" type="{claim.type.value}" '
             f'author_origin="{str(claim.author_origin).lower()}" '
-            f'importance="{claim.importance:.2f}"{arithmetic_flag}>\n'
+            f'importance="{claim.importance:.2f}" '
+            f'mechanism_support="{mechanism_support}"{arithmetic_flag}>\n'
             f"    Statement: {claim.statement}\n"
             f"{mechanism_block}"
             f"    Sources:\n{evidence_xml}\n"

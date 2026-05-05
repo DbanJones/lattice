@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -137,6 +137,14 @@ class Evidence(BaseModel):
     quote_verbatim: bool = False
     quote_text: str | None = None
     page: int | None = None
+    # Phase 4: passage span + confidence. The binder records the
+    # character offsets of the bound quote within the passage text
+    # (when the LLM's extracted_quote can be located) and a numeric
+    # confidence in [0, 1] derived from binding_strength + retrieval
+    # rank. Both are optional so old graph files round-trip cleanly.
+    passage_char_start: int | None = None
+    passage_char_end: int | None = None
+    confidence: float | None = None
 
 
 class Claim(BaseModel):
@@ -768,3 +776,282 @@ class AuthorGraph(BaseModel):
     relationships: list[Relationship] = Field(default_factory=list)
     created_at: datetime
     modified_at: datetime
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 4 — paragraph trace model
+#
+# Persisted alongside rendered prose so coverage, visualisation,
+# audit, and rewrite-safety checks can answer "which graph claims
+# and source spans does this paragraph trace back to?" without
+# re-running heuristics. See lattice/docs/IMPLEMENTATION_PLAN.md
+# Phase 4.
+# ─────────────────────────────────────────────────────────
+
+
+class EvidenceSpan(BaseModel):
+    """A bound passage span used inside a paragraph trace.
+
+    The same shape can be derived from an ``Evidence`` row on a
+    ``Claim``; it's split out here so traces serialise compactly
+    without dragging the full Claim object along.
+    """
+
+    source_id: str
+    passage_id: str
+    passage_char_start: int | None = None
+    passage_char_end: int | None = None
+    binding_strength: BindingStrength
+    confidence: float | None = None
+    quote_text: str | None = None
+
+
+class SentenceTrace(BaseModel):
+    index: int
+    text: str
+    char_start: int       # offset within the paragraph text
+    char_end: int
+    claim_ids: list[str] = Field(default_factory=list)
+    source_ids: list[str] = Field(default_factory=list)
+    evidence_spans: list[EvidenceSpan] = Field(default_factory=list)
+
+
+class ParagraphTrace(BaseModel):
+    index: int            # paragraph index within the cluster prose
+    text: str
+    cluster_id: str
+    section_id: str | None = None
+    sentences: list[SentenceTrace] = Field(default_factory=list)
+
+
+class ClusterTrace(BaseModel):
+    cluster_id: str
+    section_id: str | None = None
+    paragraphs: list[ParagraphTrace] = Field(default_factory=list)
+
+
+class ParagraphTraceReport(BaseModel):
+    """Top-level artefact persisted at
+    ``.lattice/paragraph_traces.<voice>.json``."""
+
+    project_name: str
+    voice_name: str
+    generated_at: datetime
+    clusters: dict[str, ClusterTrace] = Field(default_factory=dict)
+    # Quick stats so consumers don't have to walk the whole report
+    # just to summarise it.
+    paragraph_count: int = 0
+    sentence_count: int = 0
+    traced_sentence_count: int = 0  # sentences with >=1 claim_id
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 5 — rewrite quality model
+#
+# Mechanism discipline + structured review proposals + redraft
+# modes. The renderer classifies each claim's mechanism by how
+# strongly the source evidence backs it; the supervisor review
+# emits typed proposals carrying the claim/source/relationship
+# IDs they affect; the cockpit accepts or rejects each one.
+# See lattice/docs/IMPLEMENTATION_PLAN.md Phase 5.
+# ─────────────────────────────────────────────────────────
+
+
+class MechanismSupport(str, Enum):
+    """How well a claim's stated ``mechanism`` is supported by its
+    bound evidence. The renderer uses this to decide how confidently
+    to render the mechanism in prose:
+
+    - ``source_supported``: at least one Evidence row has
+      ``binding_strength=strong``. Render as factual.
+    - ``author_specified``: the author wrote a mechanism on a
+      ``user_synthesis`` / ``author_origin`` claim with no strong
+      source backing. Render with hedged authorial framing
+      (the voice file decides exact form).
+    - ``unknown``: the claim has a mechanism but neither strong
+      evidence nor author origin to back it. Renderer must NOT
+      smooth it into prose; emit a marker instead so the audit
+      can flag it. This is the case Phase 5 is trying to catch.
+    - ``none``: the claim has no mechanism field at all (most
+      claims). Renderer behaves as before.
+    """
+
+    source_supported = "source_supported"
+    author_specified = "author_specified"
+    unknown = "unknown"
+    none = "none"
+
+
+class RedraftMode(str, Enum):
+    """Redraft-pass intent. Each mode produces a different system-
+    prompt prelude in the chunked renderer; the renderer's hard
+    constraints (claim preservation, citation discipline, etc.)
+    apply across all modes.
+
+    - ``conservative_polish``: tighten prose, preserve every claim
+      and connector. Default for re-runs after a small graph edit.
+    - ``argument_repair``: prioritise logical flow and reasoning
+      moves; allowed to reshape sentences as long as no claim is
+      dropped.
+    - ``evidence_integration``: weave bound evidence more tightly;
+      prefer engagement over name-drop.
+    - ``compression``: shorten while preserving every required
+      claim. Target the lower end of the cluster's word range.
+    - ``expansion``: develop the cluster further. Target the upper
+      end of the word range. Use this when audit flags are
+      \"underdeveloped section\" or \"thin coverage\".
+    """
+
+    conservative_polish = "conservative_polish"
+    argument_repair = "argument_repair"
+    evidence_integration = "evidence_integration"
+    compression = "compression"
+    expansion = "expansion"
+
+
+class ProposalKind(str, Enum):
+    clarity = "clarity"
+    precision = "precision"
+    logic = "logic"
+    voice = "voice"
+    citation = "citation"
+    mechanism = "mechanism"
+    other = "other"
+
+
+class ProposalStatus(str, Enum):
+    pending = "pending"
+    accepted = "accepted"
+    rejected = "rejected"
+    superseded = "superseded"
+
+
+class ReviewProposal(BaseModel):
+    """One graph-aware supervisor proposal.
+
+    Each proposal lists the claim / source / relationship IDs it
+    affects so the cockpit can resolve a meaningful selection from
+    a single click and the apply pipeline (Phase 7) can record an
+    audit trail. ``before_text`` and ``after_text`` carry the
+    surgical change; the cluster-level diff lives on the parent
+    ``ClusterRevision`` for backwards compatibility.
+    """
+
+    proposal_id: str
+    kind: ProposalKind = ProposalKind.other
+    cluster_id: str
+    section_id: str | None = None
+    affects_claim_ids: list[str] = Field(default_factory=list)
+    affects_source_ids: list[str] = Field(default_factory=list)
+    affects_relationship_ids: list[str] = Field(default_factory=list)
+    before_text: str = ""
+    after_text: str = ""
+    comment: str = ""
+    severity: Literal["nit", "suggestion", "concern"] = "suggestion"
+    status: ProposalStatus = ProposalStatus.pending
+
+
+class ProposalDecision(BaseModel):
+    """An accept/reject record for a ``ReviewProposal``. Persisted
+    at ``.lattice/proposal_decisions.<voice>.json`` so the apply
+    pipeline (Phase 7) has a complete history."""
+
+    proposal_id: str
+    cluster_id: str
+    decision: ProposalStatus  # accepted | rejected | superseded
+    decided_at: datetime
+    decided_by: str = "user"
+    rationale: str = ""
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 7 — provenance + versioning
+#
+# A ``Snapshot`` is a full, restorable copy of the project state
+# (graph, clusters, sources, audit flags) taken before a major
+# mutation. Activities create one before they run; users can list,
+# inspect (diff), and revert to any prior snapshot. ``GraphDiff``
+# is the structural delta between two snapshots (or between a
+# snapshot and current state) — used by the changelog view to
+# answer "what changed?" at the argument level, not the file level.
+# ─────────────────────────────────────────────────────────
+
+
+class SnapshotKind(str, Enum):
+    """Why a snapshot was taken. The activity dispatcher picks one
+    of these (keyed off the activity verb) so the changelog view
+    can surface meaningful labels without re-deriving from
+    timestamps."""
+
+    manual = "manual"
+    before_ingest = "before_ingest"
+    before_scaffold = "before_scaffold"
+    before_draft = "before_draft"
+    before_find_gaps = "before_find_gaps"
+    before_refine = "before_refine"
+    before_restructure = "before_restructure"
+    before_review = "before_review"
+    before_redraft = "before_redraft"
+    pre_revert = "pre_revert"  # taken automatically before a revert
+
+
+class Snapshot(BaseModel):
+    """A restorable copy of the project state.
+
+    Snapshots persist to ``.lattice/snapshots/<snapshot_id>.json``
+    as a single bundle. Restoring writes the embedded graph /
+    clusters / sources / audit flags back to the canonical paths.
+    """
+
+    snapshot_id: str
+    kind: SnapshotKind = SnapshotKind.manual
+    created_at: datetime
+    actor: str = "user"
+    message: str = ""
+    # Embedded state. Optional fields default to None / empty so a
+    # snapshot can be taken on a fresh project (no graph yet).
+    graph: AuthorGraph | None = None
+    clusters: list[Cluster] = Field(default_factory=list)
+    sources: list[Source] = Field(default_factory=list)
+    # Audit flags are voice-keyed on disk; we mirror that shape.
+    audit_flags: dict[str, list[AuditFlag]] = Field(default_factory=dict)
+
+
+# Forward declaration used by GraphDiff below.
+class _ClaimFieldChange(BaseModel):
+    field: str
+    before: Any = None
+    after: Any = None
+
+
+class ClaimChange(BaseModel):
+    """One entry in a graph diff describing how a claim changed."""
+
+    claim_id: str
+    section_id: str | None = None
+    fields: list[_ClaimFieldChange] = Field(default_factory=list)
+
+
+class GraphDiff(BaseModel):
+    """Structural delta between two argument graphs.
+
+    Returned by ``diff_graphs(before, after)``. The cockpit History
+    view consumes the counts; the JSON endpoint exposes the full
+    payload so users can inspect every change.
+    """
+
+    sections_added: list[str] = Field(default_factory=list)
+    sections_removed: list[str] = Field(default_factory=list)
+    claims_added: list[str] = Field(default_factory=list)
+    claims_removed: list[str] = Field(default_factory=list)
+    claims_modified: list[ClaimChange] = Field(default_factory=list)
+    relationships_added: list[str] = Field(default_factory=list)
+    relationships_removed: list[str] = Field(default_factory=list)
+    sources_added: list[str] = Field(default_factory=list)
+    sources_removed: list[str] = Field(default_factory=list)
+    clusters_added: list[str] = Field(default_factory=list)
+    clusters_removed: list[str] = Field(default_factory=list)
+    clusters_modified: list[str] = Field(default_factory=list)
+    # Convenience summary, computed when the diff is built so callers
+    # don't have to add up list lengths every time.
+    total_changes: int = 0

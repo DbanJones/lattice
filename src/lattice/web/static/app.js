@@ -752,9 +752,9 @@ async function renderProjectDetail(name, sectionId, subSectionId) {
   main.appendChild(cloneTemplate("tpl-project-detail"));
 
   // Load detail in parallel.
-  let detail, hierarchy, drafts, outlineStatus, runHistory;
+  let detail, hierarchy, drafts, outlineStatus, runHistory, projectStateData;
   try {
-    [detail, hierarchy, drafts, outlineStatus, runHistory] = await Promise.all([
+    [detail, hierarchy, drafts, outlineStatus, runHistory, projectStateData] = await Promise.all([
       fetchJSON(`/api/projects/${encodeURIComponent(name)}`),
       fetchJSON(`/api/projects/${encodeURIComponent(name)}/hierarchy`),
       fetchJSON(`/api/projects/${encodeURIComponent(name)}/drafts`),
@@ -762,6 +762,8 @@ async function renderProjectDetail(name, sectionId, subSectionId) {
         .catch(() => null),
       fetchJSON(`/api/projects/${encodeURIComponent(name)}/run-history`)
         .catch(() => ({history: [], latest_by_level: {}, summary: {}})),
+      fetchJSON(`/api/projects/${encodeURIComponent(name)}/state`)
+        .catch(() => null),
     ]);
   } catch (err) {
     main.querySelector('[data-bind="dashboard"]').innerHTML =
@@ -773,6 +775,7 @@ async function renderProjectDetail(name, sectionId, subSectionId) {
   state.drafts = drafts;
   state.outlineStatus = outlineStatus;
   state.runHistory = runHistory;
+  state.projectState = projectStateData;
 
   // Header — prefer the human-readable display name, fall back to slug.
   const headerName = detail.display_name || name;
@@ -1072,11 +1075,13 @@ async function renderDashboard(main) {
   const drafts = state.drafts || [];
   const runHistory = state.runHistory || {history: [], summary: {}};
   const lastRun = runHistory.history?.slice(-1)[0];
-  const completedLevels = runHistory.summary?.levels_completed_successfully || [];
+  const projectStateData = state.projectState || null;
+  const activityHistory = projectStateData?.history || [];
+  const lastActivity = activityHistory.slice(-1)[0] || null;
 
   // ── 1. Action items panel — what the user should do next ──
   const actionItems = computeActionItems({
-    outlineStatus, drafts, completedLevels, auditFlags, sourcesIndexed: 0,
+    outlineStatus, drafts, projectStateData, auditFlags,
   });
 
   // ── 2. Paper preview source: default to the current outline (the
@@ -1165,10 +1170,10 @@ async function renderDashboard(main) {
             ${paperOptions.length
               ? `<div class="muted small">Loading…</div>`
               : `<div class="empty-state" style="padding: 24px 0;">
-                  <p>No paper produced yet. Set up an outline, then run a review.</p>
+                  <p>No paper produced yet. Set up an outline, then run Scaffold and Draft.</p>
                   <div style="display: flex; gap: 8px; margin-top: 12px; justify-content: center;">
                     <button class="btn primary" data-action="goto-outline">Go to Outline</button>
-                    <button class="btn" data-action="goto-review">Run a review</button>
+                    <button class="btn" data-action="goto-activities">Go to Activities</button>
                   </div>
                 </div>`}
           </div>
@@ -1194,8 +1199,8 @@ async function renderDashboard(main) {
       </div>
 
       <div class="dashboard-col-side">
-        ${renderDashboardLatestRunCard(lastRun)}
-        ${renderDashboardRecentActivityCard(runHistory.history?.slice(-5).reverse() || [], changelogs)}
+        ${renderDashboardLatestActivityCard(lastActivity, lastRun)}
+        ${renderDashboardRecentActivityCard(activityHistory, runHistory.history || [], changelogs)}
         ${renderDashboardThesisCard(h)}
       </div>
     </div>`;
@@ -1328,29 +1333,32 @@ async function renderDashboard(main) {
   });
 }
 
-function computeActionItems({outlineStatus, drafts, completedLevels, auditFlags}) {
+function computeActionItems({outlineStatus, drafts, projectStateData, auditFlags}) {
   const items = [];
+  const markers = projectStateData?.markers || {};
+  const next = projectStateData?.next_activity || null;
+
   if (!outlineStatus || !outlineStatus.outline.exists) {
     items.push({
       severity: "bad",
       title: "No outline yet",
-      body: "Add a `# THESIS` and `# A. Section` outline before running a review.",
+      body: "Add a `# THESIS` and `# A. Section` outline before scaffolding.",
       cta: {tab: "outline", label: "Go to Outline"},
     });
   } else if (!outlineStatus.outline.is_structured) {
     items.push({
       severity: "warn",
       title: "Outline is raw prose",
-      body: "Lattice will auto-structure on next review, or you can edit it now.",
-      cta: {tab: "review", label: "Run review"},
+      body: "Run Scaffold to auto-structure it into thesis, sections, and claim bullets.",
+      cta: {tab: "activities", label: "Go to Scaffold"},
     });
   }
-  if (drafts.length === 0 && outlineStatus?.outline.is_structured) {
+  if (drafts.length === 0 && outlineStatus?.outline.is_structured && markers.has_clusters) {
     items.push({
       severity: "warn",
-      title: "Outline is ready, no draft yet",
-      body: "Run a Quick review to render the prose for the first time.",
-      cta: {tab: "review", label: "Run review"},
+      title: "Scaffold ready, no draft yet",
+      body: "Run Draft to render the prose for the first time.",
+      cta: {tab: "activities", label: "Go to Draft"},
     });
   }
   const criticalFlags = auditFlags.filter(f => f.severity === "critical").length;
@@ -1358,39 +1366,80 @@ function computeActionItems({outlineStatus, drafts, completedLevels, auditFlags}
     items.push({
       severity: "bad",
       title: `${criticalFlags} critical audit flag${criticalFlags === 1 ? "" : "s"}`,
-      body: "Critical issues block delivery. Re-run with autocorrect or address by hand.",
-      cta: {tab: "review", subtab: "audit", label: "View flags"},
+      body: "Critical issues block delivery. Re-run Refine with autocorrect or address by hand.",
+      cta: {tab: "output", subtab: "audit", label: "View flags"},
     });
   }
-  if (drafts.length > 0 && !completedLevels.includes("standard") && !completedLevels.includes("deep")) {
+  if (markers.has_paper && !markers.has_audit_flags) {
     items.push({
       severity: "info",
       title: "Draft exists but no audit run",
-      body: "Standard review adds audit + voice review on top of the existing draft.",
-      cta: {tab: "review", label: "Run Standard"},
+      body: "Refine adds audit + voice review on top of the existing draft.",
+      cta: {tab: "activities", label: "Go to Refine"},
+    });
+  }
+  // If nothing else matched but we have a recommendation, surface it
+  // as a low-priority "what next?" hint so the user always sees the
+  // single best next step.
+  if (items.length === 0 && next) {
+    items.push({
+      severity: "info",
+      title: `Recommended next: ${next.label}`,
+      body: next.why,
+      cta: {tab: "activities", label: `Go to ${next.label}`},
     });
   }
   return items;
 }
 
-function renderDashboardLatestRunCard(lastRun) {
-  if (!lastRun) {
+// Capitalises an activity verb (e.g. "find_gaps" → "Find gaps") for
+// display, falling back to the raw label if the verb is unknown.
+const ACTIVITY_LABEL_MAP = {
+  ingest: "Ingest", scaffold: "Scaffold", draft: "Draft",
+  find_gaps: "Find gaps", refine: "Refine",
+  restructure: "Restructure", review: "Review",
+};
+function activityLabel(verb) {
+  if (!verb) return "Activity";
+  return ACTIVITY_LABEL_MAP[verb] || verb;
+}
+
+function renderDashboardLatestActivityCard(lastActivity, lastRun) {
+  // Prefer the new activity history; fall back to legacy run-history
+  // for projects that only have pre-activity records.
+  if (!lastActivity && !lastRun) {
     return `
       <div class="card">
-        <h3 class="subhead">Latest review</h3>
-        <p class="muted small">No reviews yet.</p>
-        <button class="btn primary sm" data-action="goto-review">Run your first review →</button>
+        <h3 class="subhead">Latest activity</h3>
+        <p class="muted small">Nothing run yet.</p>
+        <button class="btn primary sm" data-action="goto-activities">Start an activity →</button>
       </div>`;
   }
+  if (lastActivity) {
+    const ok = lastActivity.ok !== false;
+    const finished = formatTimestamp(new Date(lastActivity.finished_at).getTime() / 1000);
+    return `
+      <div class="card">
+        <h3 class="subhead">Latest activity</h3>
+        <div class="kv-list">
+          <div class="kv"><span class="k">Activity</span><span class="v"><span class="pill">${escapeHtml(activityLabel(lastActivity.verb))}</span></span></div>
+          <div class="kv"><span class="k">Mode</span><span class="v">${escapeHtml(lastActivity.mode || "thorough")}</span></div>
+          <div class="kv"><span class="k">Outcome</span><span class="v">${ok ? `<span class="pill ok">ok</span>` : `<span class="pill bad">failed</span>`}</span></div>
+          <div class="kv"><span class="k">Duration</span><span class="v">${formatDuration(lastActivity.elapsed_seconds || 0)}</span></div>
+          <div class="kv"><span class="k">Finished</span><span class="v">${finished}</span></div>
+        </div>
+        <button class="btn primary sm" style="margin-top: 12px; width: 100%;" data-action="goto-activities">Open Activities →</button>
+      </div>`;
+  }
+  // Legacy fallback for projects with no activity_history.json yet.
   const ok = lastRun.finalise_succeeded;
   const finished = formatTimestamp(new Date(lastRun.finished_at).getTime() / 1000);
   const finalPath = lastRun.final_path || "";
   const finalFilename = finalPath ? finalPath.split(/[\\/]/).pop() : "";
   return `
     <div class="card">
-      <h3 class="subhead">Latest review</h3>
+      <h3 class="subhead">Latest activity <span class="muted small">(legacy)</span></h3>
       <div class="kv-list">
-        <div class="kv"><span class="k">Level</span><span class="v"><span class="pill">${escapeHtml(lastRun.level)}</span></span></div>
         <div class="kv"><span class="k">Outcome</span><span class="v">${ok ? `<span class="pill ok">delivered</span>` : `<span class="pill bad">blocked</span>`}</span></div>
         <div class="kv"><span class="k">Clusters</span><span class="v">${lastRun.rendered_clusters} of ${lastRun.total_clusters}</span></div>
         <div class="kv"><span class="k">Audit flags</span><span class="v">${lastRun.audit_flags || 0}</span></div>
@@ -1403,24 +1452,52 @@ function renderDashboardLatestRunCard(lastRun) {
     </div>`;
 }
 
-function renderDashboardRecentActivityCard(history, changelogs) {
-  if (!history.length && !changelogs.length) return "";
-  const rows = history.map(r => {
+function renderDashboardRecentActivityCard(activityHistory, runHistory, changelogs) {
+  // Merge activity history (verb-named) and legacy run history
+  // (level-named) into a single chronological feed. Activity entries
+  // always render with their verb; legacy entries render with a
+  // "legacy" tag and no review-depth wording.
+  const merged = [];
+  for (const a of activityHistory) {
+    merged.push({
+      kind: "activity",
+      label: activityLabel(a.verb),
+      finished_at: a.finished_at,
+      ok: a.ok !== false,
+      elapsed: a.elapsed_seconds || 0,
+      stats: a.stats || null,
+    });
+  }
+  for (const r of runHistory) {
+    merged.push({
+      kind: "legacy",
+      label: "legacy run",
+      finished_at: r.finished_at,
+      ok: !!r.finalise_succeeded,
+      elapsed: r.elapsed_seconds || 0,
+      stats: `${r.rendered_clusters}/${r.total_clusters} clusters · ${r.audit_flags || 0} flags`,
+      changelogKey: r.level || "",
+    });
+  }
+  if (!merged.length && !changelogs.length) return "";
+  merged.sort((a, b) => (a.finished_at < b.finished_at ? 1 : -1));
+  const recent = merged.slice(0, 5);
+  const rows = recent.map(r => {
     const finished = formatTimestamp(new Date(r.finished_at).getTime() / 1000);
     const matchingLog = changelogs.find(cl => cl.filename.startsWith(
       r.finished_at.slice(0, 4) + r.finished_at.slice(5, 7) + r.finished_at.slice(8, 10)
-    ) && cl.filename.includes(r.level));
-    const okPill = r.finalise_succeeded ? `<span class="pill ok">✓</span>` : `<span class="pill bad">✗</span>`;
+    ) && (r.changelogKey ? cl.filename.includes(r.changelogKey) : true));
+    const okPill = r.ok ? `<span class="pill ok">✓</span>` : `<span class="pill bad">✗</span>`;
+    const tag = r.kind === "legacy" ? `<span class="muted small">(legacy)</span>` : "";
+    const stats = typeof r.stats === "string" ? r.stats : "";
     return `
       <li class="activity-row">
         ${okPill}
         <div class="activity-meta">
-          <strong>${escapeHtml(r.level)}</strong>
-          <span class="muted small">${finished} · ${formatDuration(r.elapsed_seconds)}</span>
+          <strong>${escapeHtml(r.label)}</strong> ${tag}
+          <span class="muted small">${finished} · ${formatDuration(r.elapsed)}</span>
         </div>
-        <div class="activity-stats muted small">
-          ${r.rendered_clusters}/${r.total_clusters} clusters · ${r.audit_flags || 0} flags
-        </div>
+        <div class="activity-stats muted small">${stats}</div>
         <div>${matchingLog
           ? `<button class="btn-link sm" data-changelog="${escapeAttr(matchingLog.filename)}">view changes</button>`
           : ""}</div>
@@ -1430,7 +1507,7 @@ function renderDashboardRecentActivityCard(history, changelogs) {
     <div class="card">
       <h3 class="subhead">Recent activity</h3>
       <ul class="activity-list">${rows}</ul>
-      <button class="btn-link sm" data-action="goto-review">Full history in Review tab →</button>
+      <button class="btn-link sm" data-action="goto-activities">Full history in Activities tab →</button>
     </div>`;
 }
 
@@ -1630,13 +1707,39 @@ function renderHierarchyGraph(main) {
   const panel = main.querySelector('[data-bind="graph"]');
   if (!panel) return;
   const projSlug = encodeURIComponent(state.current);
+  // Voices drive the unrenderable-marker scan: the visualiser reads
+  // ``.lattice/drafts/<voice>/cluster_*.md``. Surface a picker only
+  // when the project has rendered more than one voice.
+  const voices = state.detail?.voices || [];
+  const voiceQs = v => v ? `?voice=${encodeURIComponent(v)}` : "";
+  const initialVoice = voices[0] || "";
+  const picker = voices.length > 1
+    ? `<label class="muted small" style="display:flex; gap:6px; align-items:center;">
+         Voice
+         <select data-bind="graph-voice">
+           ${voices.map(v => `<option value="${escapeAttr(v)}">${escapeHtml(v)}</option>`).join("")}
+         </select>
+       </label>`
+    : "";
   panel.innerHTML = `
     <div class="graph-frame-wrap">
-      <iframe class="graph-viz-frame" src="/api/projects/${projSlug}/graph-viz" loading="lazy"></iframe>
+      <div class="graph-controls" style="display:flex; gap:12px; align-items:center; justify-content:flex-end; margin-bottom:6px;">
+        ${picker}
+      </div>
+      <iframe class="graph-viz-frame" data-bind="graph-iframe"
+              src="/api/projects/${projSlug}/graph-viz${voiceQs(initialVoice)}"
+              loading="lazy"></iframe>
       <p class="muted small" style="text-align: right; margin-top: 6px;">
         Interactive cytoscape.js layout · drag nodes, scroll to zoom, click for details
       </p>
     </div>`;
+  const select = panel.querySelector('[data-bind="graph-voice"]');
+  const iframe = panel.querySelector('[data-bind="graph-iframe"]');
+  if (select && iframe) {
+    select.addEventListener("change", () => {
+      iframe.src = `/api/projects/${projSlug}/graph-viz${voiceQs(select.value)}`;
+    });
+  }
 }
 
 function renderClaimNode(claim) {
@@ -2494,7 +2597,7 @@ async function renderDrafts(main) {
              href="/api/projects/${projSlug}/drafts/${encodeURIComponent(d.filename)}"
              download="${escapeAttr(d.filename)}">Download</a>
         </div>`).join("")
-    : `<div class="muted small" style="padding: 8px 0;">No drafts yet. Run a review to generate one.</div>`;
+    : `<div class="muted small" style="padding: 8px 0;">No drafts yet. Run <strong>Draft</strong> to generate one.</div>`;
 
   panel.innerHTML = `
     <div class="card">
@@ -2702,7 +2805,7 @@ function renderChangelogIndexHtml(res) {
   }
   const logs = res.value.changelogs || [];
   if (!logs.length) {
-    return `<div class="empty-state"><h3>No reviews yet</h3><p>Each review writes a markdown changelog here so you can see exactly what it modified — clusters re-rendered, audit-flag deltas, outline mutations, paper word-count changes. Run a review to populate this.</p></div>`;
+    return `<div class="empty-state"><h3>No change logs yet</h3><p>Each activity writes a markdown changelog here so you can see exactly what it modified — clusters re-rendered, audit-flag deltas, outline mutations, paper word-count changes. Run an activity to populate this.</p></div>`;
   }
   const rows = logs.map(l => {
     // Filename pattern: YYYYMMDD_HHMMSS_<level>.md
@@ -2724,7 +2827,7 @@ function renderChangelogIndexHtml(res) {
   return `
     <div class="card">
       <h3 class="subhead">Change logs (newest first)</h3>
-      <p class="muted small">Click a row to inspect what that review changed.</p>
+      <p class="muted small">Click a row to inspect what that activity changed.</p>
       <div class="draft-list">${rows}</div>
     </div>
     <div class="card hidden" data-bind="changelog-viewer"></div>`;
@@ -2732,14 +2835,14 @@ function renderChangelogIndexHtml(res) {
 
 function renderAuditHtml(res) {
   if (res.status !== "fulfilled") {
-    return `<div class="empty-state"><h3>No audit data</h3><p>Run a Standard or Deep review to populate the audit.</p></div>`;
+    return `<div class="empty-state"><h3>No audit data</h3><p>Run <strong>Refine</strong> to audit the draft and populate this view.</p></div>`;
   }
   const raw = res.value && res.value.flags;
   let flags = [];
   if (Array.isArray(raw)) flags = raw;
   else if (raw && typeof raw === "object") flags = Object.values(raw).flat();
   if (!flags.length) {
-    return `<div class="empty-state"><h3>No audit flags</h3><p>The last Standard or Deep review found nothing to flag — or hasn't been run yet.</p></div>`;
+    return `<div class="empty-state"><h3>No audit flags</h3><p>The last Refine run found nothing to flag — or hasn't been run yet.</p></div>`;
   }
   const byCat = {};
   const bySev = {critical: 0, standard: 0, minor: 0};
@@ -2781,7 +2884,7 @@ function renderAuditHtml(res) {
 
 function renderVoiceHtml(res) {
   if (res.status !== "fulfilled") {
-    return `<div class="card"><p class="muted small">Voice review not generated yet. Run a Standard or Deep review to produce one.</p></div>`;
+    return `<div class="card"><p class="muted small">Voice review not generated yet. Run <strong>Refine</strong> to produce one.</p></div>`;
   }
   return `
     <div class="card">
@@ -2791,7 +2894,7 @@ function renderVoiceHtml(res) {
 
 function renderGapHtml(res) {
   if (res.status !== "fulfilled") {
-    return `<div class="card"><p class="muted small">Source-gap review not generated yet. Run a Deep review with a reference document path in Advanced options.</p></div>`;
+    return `<div class="card"><p class="muted small">Source-gap review not generated yet. Run <strong>Find gaps</strong> with a reference document path in Advanced options.</p></div>`;
   }
   const cats = {};
   res.value.gaps.forEach(g => (cats[g.category] = cats[g.category] || []).push(g));
@@ -2823,132 +2926,12 @@ function renderGapHtml(res) {
     </div>`;
 }
 
-// ─── review panel ────────────────────────────────────
-
-function renderRunPanel(main, initialSubTab) {
-  const panel = main.querySelector('[data-bind="review"]');
-  panel.innerHTML = "";
-  const validSubTabs = new Set(["run", "audit", "voice", "gap", "changelog"]);
-  const startTab = validSubTabs.has(initialSubTab) ? initialSubTab : "run";
-
-  // Sub-nav: Run controls vs the artefacts produced by previous runs
-  // (audit / voice review / source-gap / change log). Sticks Quality +
-  // change log content under Review since they're a natural pair —
-  // run produces results, look at results in same place.
-  const subnav = document.createElement("nav");
-  subnav.className = "review-subnav";
-  subnav.innerHTML = `
-    <button class="review-tab active" data-r-tab="run">Run a review</button>
-    <button class="review-tab" data-r-tab="audit">Audit flags</button>
-    <button class="review-tab" data-r-tab="voice">Voice review</button>
-    <button class="review-tab" data-r-tab="gap">Source-gap</button>
-    <button class="review-tab" data-r-tab="changelog">Change log</button>
-  `;
-  panel.appendChild(subnav);
-
-  const body = document.createElement("div");
-  body.className = "review-body";
-  panel.appendChild(body);
-
-  function showSubview(name) {
-    panel.querySelectorAll(".review-tab").forEach(t =>
-      t.classList.toggle("active", t.dataset.rTab === name));
-    body.innerHTML = `<div class="muted small" style="padding: 12px;">Loading…</div>`;
-    if (name === "run") renderReviewRunSubview(body);
-    else if (name === "audit") renderReviewAuditSubview(body);
-    else if (name === "voice") renderReviewVoiceSubview(body);
-    else if (name === "gap") renderReviewGapSubview(body);
-    else if (name === "changelog") renderReviewChangelogSubview(body);
-  }
-  panel.querySelectorAll(".review-tab").forEach(t => {
-    t.addEventListener("click", () => showSubview(t.dataset.rTab));
-  });
-  // Default to the Run sub-view, or honour the deep-link sub-tab.
-  showSubview(startTab);
-}
-
-function renderReviewRunSubview(body) {
-  body.innerHTML = "";
-
-  // Show level-progression banner so the user can see what's been
-  // done and what each level adds. Builds on top of run-history so
-  // upgrading from Quick → Standard is informed by what's cached.
-  const progressionBanner = renderLevelProgressionBanner();
-  if (progressionBanner) {
-    const bannerEl = document.createElement("div");
-    bannerEl.innerHTML = progressionBanner;
-    body.appendChild(bannerEl.firstElementChild);
-  }
-
-  body.appendChild(cloneTemplate("tpl-run-form"));
-  const panel = body;
-
-  const voiceSelect = panel.querySelector('[data-bind="voice-select"]');
-  voiceSelect.innerHTML = (state.detail.voices || ["academic"])
-    .map(v => `<option value="${escapeAttr(v)}">${escapeHtml(v)}</option>`)
-    .join("");
-
-  // Default to the first level the user hasn't successfully completed.
-  const completed = (state.runHistory?.summary?.levels_completed_successfully) || [];
-  const order = ["quick", "standard", "deep"];
-  const nextLevel = order.find(l => !completed.includes(l)) || "standard";
-  const radio = panel.querySelector(`input[name="level"][value="${nextLevel}"]`);
-  if (radio) radio.checked = true;
-
-  // Annotate level cards with a check + "completed at HH:MM" badge so
-  // the user knows the work isn't being thrown away.
-  const latestByLevel = state.runHistory?.latest_by_level || {};
-  panel.querySelectorAll(".level-option").forEach(opt => {
-    const input = opt.querySelector('input[name="level"]');
-    const lvl = input ? input.value : null;
-    if (lvl && latestByLevel[lvl]) {
-      const last = latestByLevel[lvl];
-      const card = opt.querySelector(".level-card");
-      const badge = document.createElement("div");
-      badge.className = "level-completed-badge";
-      const ok = last.finalise_succeeded;
-      badge.innerHTML = `
-        <span class="dot ${ok ? "ok" : "bad"}"></span>
-        ${ok ? "Last run delivered" : "Last run blocked"} ·
-        ${formatTimestamp(new Date(last.finished_at).getTime() / 1000)}`;
-      card.appendChild(badge);
-    }
-  });
-
-  const form = panel.querySelector(".run-form");
-  form.addEventListener("submit", async ev => {
-    ev.preventDefault();
-    const fd = new FormData(form);
-    const body = {
-      voice: fd.get("voice") || "academic",
-      level: fd.get("level") || "standard",
-      reference_path: (fd.get("reference_path") || "").trim() || null,
-      max_passes: Number(fd.get("max_passes") || 3),
-      chunk_min: Number(fd.get("chunk_min") || 3),
-      chunk_max: Number(fd.get("chunk_max") || 4),
-      force: fd.get("force") === "on",
-    };
-    try {
-      const resp = await fetch(`/api/projects/${encodeURIComponent(state.current)}/runs`, {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(body),
-      });
-      if (!resp.ok) {
-        const txt = await resp.text();
-        alert(`Failed to start run: ${txt}`);
-        return;
-      }
-      const data = await resp.json();
-      startTimeline(data, panel);
-      openWebSocket(state.current, data.run_id, panel);
-    } catch (err) {
-      alert(`Network error: ${err.message}`);
-    }
-  });
-}
-
 // ─── review sub-views: audit / voice / gap / changelog ──────
+//
+// These are shared by the Output tab subnav (see renderOutputTab).
+// The historical "Review" top-level tab and its quick/standard/deep
+// run form have been removed — runs now go through the Activities
+// tab and call the verb-named endpoints under /api/projects/.../activities/.
 
 async function renderReviewAuditSubview(body) {
   const proj = encodeURIComponent(state.current);
@@ -3106,85 +3089,76 @@ async function renderReviewChangelogSubview(body) {
   });
 }
 
-function renderLevelProgressionBanner() {
-  const completed = state.runHistory?.summary?.levels_completed_successfully || [];
-  const latest = state.runHistory?.latest_by_level || {};
-  if (!completed.length && !Object.keys(latest).length) {
-    // Fresh project — encourage starting at quick.
-    return `
-      <div class="card progression-banner">
-        <div class="progression-head">
-          <span class="dot ok"></span>
-          <strong>Fresh project</strong>
-        </div>
-        <p class="muted small" style="margin: 6px 0 0;">
-          Start with <strong>Quick</strong> to render the prose and see the document take shape (~5 min).
-          Re-run as <strong>Standard</strong> later to add audit checks and a voice review (your rendered prose is reused, so only the new checks run).
-          <strong>Deep</strong> adds an autocorrect convergence loop and a source-gap review against an external reference.
-        </p>
-      </div>`;
-  }
-
-  const stages = [
-    {key: "quick", label: "Quick", adds: "Rendered prose"},
-    {key: "standard", label: "Standard", adds: "+ Audit flags · Voice review"},
-    {key: "deep", label: "Deep", adds: "+ Autocorrect convergence · Source-gap review"},
-  ];
-  const stageHtml = stages.map(s => {
-    const done = completed.includes(s.key);
-    const last = latest[s.key];
-    const subtitle = last
-      ? `${last.finalise_succeeded ? "delivered" : "blocked"} · ${formatTimestamp(new Date(last.finished_at).getTime() / 1000)}`
-      : s.adds;
-    return `
-      <div class="progression-stage ${done ? "done" : "pending"}">
-        <div class="dot ${done ? "ok" : "muted"}"></div>
-        <div class="stage-info">
-          <strong>${s.label}</strong>
-          <span class="muted small">${escapeHtml(subtitle)}</span>
-        </div>
-      </div>`;
-  }).join("");
-
-  return `
-    <div class="card progression-banner">
-      <h3 class="subhead">What's been run</h3>
-      <div class="progression-row">${stageHtml}</div>
-      <p class="muted small" style="margin: 10px 0 0;">
-        Each level builds on the previous one — already-rendered clusters are reused, so re-running at a higher level only does the additional steps.
-      </p>
-    </div>`;
-}
-
-// ─── status strip + level progression on Overview ────
+// ─── status strip on project header ────
 
 function renderStatusStrip(main, detail, outlineStatus, drafts) {
   const slot = main.querySelector('[data-bind="status-strip"]');
   if (!slot) return;
-  const completed = state.runHistory?.summary?.levels_completed_successfully || [];
+  const markers = state.projectState?.markers || {};
+  const next = state.projectState?.next_activity || null;
   const outlineReady = outlineStatus && outlineStatus.outline.exists && outlineStatus.outline.is_structured;
-  const rendered = detail.paper_words > 0;
-  const auditComplete = completed.includes("standard") || completed.includes("deep");
-  const sourceCount = (state.detail && state.detail.cluster_count !== undefined)
-    ? (state.sourcesData?.indexed?.length || 0) : 0;
+  const rendered = !!markers.has_paper || detail.paper_words > 0;
+  const auditComplete = !!markers.has_audit_flags;
   // Each pip routes to the tab where the user can act on this state.
+  // Hint copy refers to activities (Scaffold/Draft/Refine/Find gaps),
+  // not to the retired quick/standard/deep review levels.
   const items = [
-    {label: "Outline", ok: !!outlineReady, hint: outlineReady ? "structured" : "needs setup", tab: "outline"},
-    {label: "Render", ok: rendered, hint: rendered ? `${detail.paper_words.toLocaleString()} words` : "not yet rendered", tab: "review"},
-    {label: "Audit", ok: auditComplete, hint: auditComplete ? "complete" : "run Standard", tab: "review"},
-    {label: "Source-gap", ok: completed.includes("deep"), hint: completed.includes("deep") ? "complete" : "run Deep + ref doc", tab: "review"},
-    {label: "References", ok: state.runHistory?.history?.length > 0, hint: state.detail?.cluster_count ? "indexed" : "no sources yet", tab: "references"},
+    {
+      label: "Outline",
+      ok: !!outlineReady,
+      hint: outlineReady ? "structured" : "needs setup",
+      tab: "sources",
+      subtab: "outline",
+    },
+    {
+      label: "Scaffold",
+      ok: !!markers.has_clusters,
+      hint: markers.has_clusters ? "graph + clusters ready" : "run Scaffold",
+      tab: "activities",
+    },
+    {
+      label: "Draft",
+      ok: rendered,
+      hint: rendered
+        ? `${(detail.paper_words || 0).toLocaleString()} words`
+        : "run Draft",
+      tab: "activities",
+    },
+    {
+      label: "Refine",
+      ok: auditComplete,
+      hint: auditComplete ? "audit complete" : "run Refine",
+      tab: "activities",
+    },
+    {
+      label: "References",
+      ok: state.detail?.cluster_count > 0,
+      hint: state.detail?.cluster_count ? "indexed" : "no sources yet",
+      tab: "sources",
+      subtab: "references",
+    },
   ];
   slot.innerHTML = items.map(i => `
-    <button type="button" class="status-pip ${i.ok ? "ok" : "pending"}" data-tab="${escapeAttr(i.tab)}" title="Jump to ${escapeHtml(i.tab)} tab">
+    <button type="button" class="status-pip ${i.ok ? "ok" : "pending"}" data-tab="${escapeAttr(i.tab)}"${i.subtab ? ` data-subtab="${escapeAttr(i.subtab)}"` : ""} title="Jump to ${escapeHtml(i.tab)} tab">
       <span class="dot ${i.ok ? "ok" : "muted"}"></span>
       <strong>${escapeHtml(i.label)}</strong>
       <span class="muted small">${escapeHtml(i.hint)}</span>
-    </button>`).join("");
+    </button>`).join("")
+    + (next
+      ? `<div class="status-pip next-activity" title="Recommended next step">
+          <span class="dot ok"></span>
+          <strong>Next: ${escapeHtml(next.label)}</strong>
+          <span class="muted small">${escapeHtml(next.why)}</span>
+        </div>`
+      : "");
 
-  slot.querySelectorAll(".status-pip").forEach(btn => {
+  slot.querySelectorAll(".status-pip[data-tab]").forEach(btn => {
     btn.addEventListener("click", () => {
-      navigate(`/p/${encodeURIComponent(state.current)}/${btn.dataset.tab}`);
+      const tab = btn.dataset.tab;
+      const subtab = btn.dataset.subtab;
+      navigate(subtab
+        ? `/p/${encodeURIComponent(state.current)}/${tab}/${encodeURIComponent(subtab)}`
+        : `/p/${encodeURIComponent(state.current)}/${tab}`);
     });
   });
 }
@@ -4230,14 +4204,22 @@ function renderOutputTab(main, initialSubTab) {
   const panel = main.querySelector('[data-bind="output-panel"]');
   panel.innerHTML = "";
 
+  // Cockpit is the new default surface. The legacy single-purpose
+  // sub-views (audit / voice / gap / restructure / review / changelog)
+  // remain reachable via deep links and a "Legacy panels" expander
+  // for backwards compatibility, but are no longer the primary path.
+  // Phase 7 adds the History view (snapshots + revert).
   const validSubTabs = new Set([
-    "audit", "voice", "gap", "restructure", "review", "changelog",
+    "cockpit", "history", "audit", "voice", "gap",
+    "restructure", "review", "changelog",
   ]);
-  const startTab = validSubTabs.has(initialSubTab) ? initialSubTab : "audit";
+  const startTab = validSubTabs.has(initialSubTab) ? initialSubTab : "cockpit";
 
   const subnav = document.createElement("nav");
   subnav.className = "review-subnav";
   subnav.innerHTML = `
+    <button class="review-tab" data-r-tab="cockpit">Cockpit</button>
+    <button class="review-tab" data-r-tab="history">History</button>
     <button class="review-tab" data-r-tab="audit">Audit flags</button>
     <button class="review-tab" data-r-tab="voice">Voice review</button>
     <button class="review-tab" data-r-tab="gap">Lit gaps</button>
@@ -4255,7 +4237,9 @@ function renderOutputTab(main, initialSubTab) {
     panel.querySelectorAll(".review-tab").forEach(t =>
       t.classList.toggle("active", t.dataset.rTab === name));
     body.innerHTML = `<div class="muted small" style="padding: 12px;">Loading…</div>`;
-    if (name === "audit")          renderReviewAuditSubview(body);
+    if (name === "cockpit")        renderCockpitSubview(body);
+    else if (name === "history")   renderHistorySubview(body);
+    else if (name === "audit")     renderReviewAuditSubview(body);
     else if (name === "voice")     renderReviewVoiceSubview(body);
     else if (name === "gap")       renderReviewGapSubview(body);
     else if (name === "restructure") renderRestructureSubview(body);
@@ -4266,6 +4250,787 @@ function renderOutputTab(main, initialSubTab) {
     t.addEventListener("click", () => showSubview(t.dataset.rTab));
   });
   showSubview(startTab);
+}
+
+
+// ════════════════════════════════════════════════════════════
+// Revision Cockpit — Phase 3 skeleton.
+//
+// One four-pane working surface that replaces the scattered
+// audit/voice/gap/restructure/review tabs:
+//
+//   ┌──────────────────────┬────────────────────┐
+//   │ Paper preview        │ Argument map       │
+//   ├──────────────────────┼────────────────────┤
+//   │ Issues queue         │ Evidence + claim   │
+//   │  (audit + lit gaps + │  inspector + actions│
+//   │   restructure +      │                    │
+//   │   review revisions)  │                    │
+//   └──────────────────────┴────────────────────┘
+//
+// One selection model drives all four panes: clicking a queue
+// item, paragraph, or claim selects a (clusterId, claimId) pair,
+// and every pane re-renders in sync.
+//
+// Action buttons are wired to /api/projects/.../cockpit/actions/...
+// which currently returns 501 — the routes exist so Phase 5 can
+// plug in real mutations without frontend changes.
+// ════════════════════════════════════════════════════════════
+
+function _cockpitDefaultVoice() {
+  // Pick the project's first voice when more than one is available.
+  // Fall back to "academic" so single-voice projects keep their
+  // existing behaviour.
+  const voices = state.detail?.voices || [];
+  return voices[0] || "academic";
+}
+
+function _cockpitVoice() {
+  return state.cockpit?.voice || _cockpitDefaultVoice();
+}
+
+function renderCockpitSubview(body) {
+  const projSlug = encodeURIComponent(state.current);
+  const voices = state.detail?.voices || [];
+  const initialVoice = _cockpitDefaultVoice();
+  const voicePicker = voices.length > 1
+    ? `<select data-bind="cockpit-voice"
+              style="padding:3px 6px; font-size:11px; border:1px solid var(--border); border-radius:4px; background:var(--surface);">
+        ${voices.map(v => `<option value="${escapeAttr(v)}"${v === initialVoice ? " selected" : ""}>${escapeHtml(v)}</option>`).join("")}
+      </select>`
+    : `<span class="muted small">${escapeHtml(initialVoice)}</span>`;
+  body.innerHTML = `
+    <div class="cockpit">
+      <section class="cockpit-pane paper">
+        <div class="cockpit-pane-head">
+          <h4>Paper preview</h4>
+          <span class="muted small" data-bind="cockpit-paper-meta"></span>
+          ${voicePicker}
+        </div>
+        <div class="cockpit-pane-body" data-bind="cockpit-paper">
+          <div class="muted small">Loading paper…</div>
+        </div>
+      </section>
+      <section class="cockpit-pane map">
+        <div class="cockpit-pane-head">
+          <h4>Argument map</h4>
+          <select data-bind="cockpit-map-mode"
+                  style="padding:3px 6px; font-size:11px; border:1px solid var(--border); border-radius:4px; background:var(--surface);">
+            <option value="default">Default</option>
+            <option value="thesis_support_path">Thesis support path</option>
+            <option value="section_proof_chain">Section proof chain</option>
+            <option value="weak_evidence_zones">Weak evidence zones</option>
+            <option value="counterargument_map">Counterargument map</option>
+            <option value="unrenderable_clusters">Unrenderable clusters</option>
+          </select>
+        </div>
+        <div class="cockpit-pane-body no-padding">
+          <iframe data-bind="cockpit-map"
+                  src="/api/projects/${projSlug}/graph-viz?voice=${encodeURIComponent(initialVoice)}&mode=default"
+                  loading="lazy"></iframe>
+        </div>
+      </section>
+      <section class="cockpit-pane queue">
+        <div class="cockpit-pane-head">
+          <h4>Issues &amp; actions</h4>
+          <span class="muted small" data-bind="cockpit-queue-counts"></span>
+        </div>
+        <div class="cockpit-queue-toolbar" data-bind="cockpit-queue-filters"></div>
+        <div class="cockpit-pane-body no-padding" data-bind="cockpit-queue">
+          <div class="muted small" style="padding:14px;">Loading queue…</div>
+        </div>
+      </section>
+      <section class="cockpit-pane evidence">
+        <div class="cockpit-pane-head">
+          <h4>Claim &amp; evidence</h4>
+          <span class="muted small" data-bind="cockpit-claim-meta"></span>
+        </div>
+        <div class="cockpit-pane-body" data-bind="cockpit-claim">
+          <div class="cockpit-pane-body empty" style="padding:0;">
+            Select a queue item or click a paragraph to inspect a claim.
+          </div>
+        </div>
+      </section>
+    </div>`;
+
+  // Bootstrap the cockpit's selection-model state. Stored on the
+  // outer `state` so paragraph clicks and queue clicks can find
+  // each other across panes.
+  state.cockpit = {
+    queue: [],
+    sources: {},
+    selectedItemId: null,
+    selectedClaimId: null,
+    selectedClusterId: null,
+    activeFilter: "all",
+    mapMode: "default",
+    voice: initialVoice,
+    paperMarkdown: "",
+    clusterByParagraph: {},
+  };
+
+  // Wire the voice picker (only present when there's more than one
+  // voice on disk; fall back is a static label).
+  const voiceSel = body.querySelector('[data-bind="cockpit-voice"]');
+  if (voiceSel) {
+    voiceSel.addEventListener("change", () => {
+      state.cockpit.voice = voiceSel.value;
+      // Re-load every voice-keyed surface in the cockpit.
+      loadCockpitPaper(body);
+      loadCockpitQueue(body);
+      const iframe = body.querySelector('[data-bind="cockpit-map"]');
+      if (iframe) {
+        const mode = state.cockpit.mapMode || "default";
+        iframe.src = `/api/projects/${projSlug}/graph-viz?voice=${encodeURIComponent(state.cockpit.voice)}&mode=${encodeURIComponent(mode)}`;
+      }
+      // Clear the evidence pane — selection IDs are voice-agnostic
+      // but the rendered paragraph and audit flags are not.
+      const claimTarget = body.querySelector('[data-bind="cockpit-claim"]');
+      if (claimTarget) {
+        claimTarget.innerHTML = `<div class="cockpit-pane-body empty" style="padding:0;">Select a queue item or click a paragraph to inspect a claim.</div>`;
+      }
+    });
+  }
+
+  wireCockpitMapBridge(body);
+  loadCockpitPaper(body);
+  loadCockpitQueue(body);
+}
+
+// Phase 6 — bidirectional selection sync between the cockpit and
+// the graph-viz iframe. The iframe accepts:
+//   {type: 'lattice:set-mode', mode}        — switch the map overlay
+//   {type: 'lattice:select-claim', claim_id} — highlight a claim
+// The iframe emits:
+//   {type: 'lattice:node-tapped', node_id, kind, section_id, cluster_id}
+function wireCockpitMapBridge(body) {
+  const iframe = body.querySelector('[data-bind="cockpit-map"]');
+  const modePicker = body.querySelector('[data-bind="cockpit-map-mode"]');
+  if (!iframe || !modePicker) return;
+
+  modePicker.addEventListener("change", () => {
+    const mode = modePicker.value;
+    state.cockpit.mapMode = mode;
+    // Reload the iframe with the new mode in the URL so deep-links
+    // also work, *and* postMessage so an already-loaded iframe
+    // updates without a full reload roundtrip.
+    try {
+      iframe.contentWindow?.postMessage(
+        {type: "lattice:set-mode", mode}, "*");
+    } catch (e) { /* cross-origin guard */ }
+  });
+
+  // When the iframe taps a claim node, surface it in the queue +
+  // evidence panes. Filters the queue down to items targeting the
+  // tapped claim's cluster so the user immediately sees what's
+  // actionable on it.
+  window.addEventListener("message", evt => {
+    const msg = evt.data;
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type !== "lattice:node-tapped") return;
+    if (!msg.node_id) return;
+    state.cockpit.selectedClaimId = msg.node_id;
+    state.cockpit.selectedClusterId = msg.cluster_id || null;
+    // Re-render the queue with the new selection highlight (no
+    // filter change — the user just wants to see what touches this
+    // claim) and load the claim into the evidence pane.
+    const queueTarget = body.querySelector('[data-bind="cockpit-queue"]');
+    if (queueTarget) renderCockpitQueueList(queueTarget, body);
+    loadCockpitClaim(body, msg.node_id);
+  });
+}
+
+async function loadCockpitPaper(body) {
+  const proj = encodeURIComponent(state.current);
+  const target = body.querySelector('[data-bind="cockpit-paper"]');
+  const meta = body.querySelector('[data-bind="cockpit-paper-meta"]');
+  try {
+    const text = await fetchText(
+      `/api/projects/${proj}/paper?voice=${encodeURIComponent(_cockpitVoice())}`);
+    state.cockpit.paperMarkdown = text;
+    // Walk the raw markdown to extract paragraph→cluster bindings
+    // (marked.js drops the HTML comments before they reach the DOM).
+    state.cockpit.clusterByParagraph = _parseClusterBoundaries(text);
+    target.innerHTML = `<article class="cockpit-paper">${renderMarkdown(text)}</article>`;
+    if (meta) meta.textContent = `${text.split(/\s+/).length.toLocaleString()} words`;
+    annotateCockpitParagraphs(target, body);
+  } catch (err) {
+    state.cockpit.paperMarkdown = "";
+    state.cockpit.clusterByParagraph = {};
+    target.innerHTML = `<div class="cockpit-pane-body empty" style="padding:0;">No rendered paper yet — run <strong>Draft</strong> first.</div>`;
+  }
+}
+
+// Parse the joined paper markdown for cluster boundary markers
+// emitted by the finaliser:
+//   <!-- lattice:cluster c.x.1 s.x -->
+// Returns a map keyed by post-marker paragraph index in the rendered
+// DOM (0-based) → {cluster_id, section_id}. The mapping is
+// approximate but stable: each marker is followed by exactly one
+// cluster's prose, which becomes one or more <p> elements after
+// markdown rendering.
+function _parseClusterBoundaries(markdown) {
+  const out = {};
+  if (!markdown) return out;
+  // Split the markdown on the marker. Track which paragraphs each
+  // marker introduces by counting blank-line-separated blocks in
+  // the chunk between consecutive markers.
+  const re = /<!--\s*lattice:cluster\s+([^\s]+)\s+([^\s]+)\s*-->/g;
+  // Walk markers in order, slicing the markdown into "before first
+  // marker | block 0 | block 1 | …".
+  const markers = [];
+  let m;
+  while ((m = re.exec(markdown)) !== null) {
+    markers.push({
+      cluster_id: m[1], section_id: m[2],
+      start: m.index, end: m.index + m[0].length,
+    });
+  }
+  if (!markers.length) return out;
+  // Count <p>-equivalent paragraphs ahead of the first marker.
+  let paragraphCursor = _countMarkdownParagraphs(markdown.slice(0, markers[0].start));
+  for (let i = 0; i < markers.length; i++) {
+    const startSlice = markers[i].end;
+    const endSlice = i + 1 < markers.length ? markers[i + 1].start : markdown.length;
+    const chunk = markdown.slice(startSlice, endSlice);
+    const nParas = _countMarkdownParagraphs(chunk);
+    for (let j = 0; j < nParas; j++) {
+      out[paragraphCursor + j] = {
+        cluster_id: markers[i].cluster_id,
+        section_id: markers[i].section_id,
+      };
+    }
+    paragraphCursor += nParas;
+  }
+  return out;
+}
+
+// Count rendered <p> elements a markdown chunk would produce.
+// Approximation good enough for binding: split on blank lines, drop
+// chunks that are only headings, list markers, or whitespace.
+function _countMarkdownParagraphs(chunk) {
+  if (!chunk) return 0;
+  let count = 0;
+  for (const block of chunk.split(/\n{2,}/)) {
+    const stripped = block.trim();
+    if (!stripped) continue;
+    // Skip ATX headings — they render as <h1>..<h6>, not <p>.
+    if (/^#{1,6}\s/.test(stripped)) continue;
+    // Skip HTML comments — they don't render at all.
+    if (stripped.startsWith("<!--") && stripped.endsWith("-->")) continue;
+    // List blocks render as <ul>/<ol>, not as a single <p>; the
+    // current cockpit selector picks up <li>s though, so count each
+    // bullet as one paragraph for binding purposes.
+    if (/^[\-\*\+]\s/m.test(stripped)) {
+      const items = stripped.split(/\n(?=[\-\*\+]\s)/).filter(s => s.trim());
+      count += Math.max(1, items.length);
+      continue;
+    }
+    count += 1;
+  }
+  return count;
+}
+
+function annotateCockpitParagraphs(target, body) {
+  const paras = target.querySelectorAll(".cockpit-paper p, .cockpit-paper li");
+  const bindings = state.cockpit.clusterByParagraph || {};
+  paras.forEach((p, i) => {
+    p.classList.add("cockpit-paragraph");
+    p.dataset.idx = String(i);
+    const binding = bindings[i];
+    if (binding) {
+      p.dataset.clusterId = binding.cluster_id;
+      p.dataset.sectionId = binding.section_id;
+    }
+    p.addEventListener("click", () => {
+      target.querySelectorAll(".cockpit-paragraph.selected").forEach(el =>
+        el.classList.remove("selected"));
+      p.classList.add("selected");
+      const b = state.cockpit.clusterByParagraph?.[Number(p.dataset.idx)];
+      if (!b) return;
+      // Drive cockpit selection. When the cluster has exactly one
+      // claim, also load the claim into the evidence pane; otherwise
+      // surface the cluster-level selection so the user can pick a
+      // specific claim from the queue or the map.
+      state.cockpit.selectedClusterId = b.cluster_id;
+      const claimId = _firstClaimInCluster(b.cluster_id);
+      state.cockpit.selectedClaimId = claimId;
+      const queueTarget = body.querySelector('[data-bind="cockpit-queue"]');
+      if (queueTarget) renderCockpitQueueList(queueTarget, body);
+      if (claimId) {
+        loadCockpitClaim(body, claimId);
+        // Forward the selection to the graph iframe.
+        const iframe = body.querySelector('[data-bind="cockpit-map"]');
+        if (iframe) {
+          try {
+            iframe.contentWindow?.postMessage({
+              type: "lattice:select-claim", claim_id: claimId,
+            }, "*");
+          } catch (e) { /* same-origin guard */ }
+        }
+      }
+    });
+  });
+}
+
+// Best-effort claim lookup for a cluster: scan the queue's
+// affects_claim_ids since that's the data already loaded in the
+// cockpit. For richer paragraph→claim resolution, Phase 4 traces are
+// the canonical source — wiring those in is a follow-up.
+function _firstClaimInCluster(clusterId) {
+  for (const item of state.cockpit.queue || []) {
+    if (item.target_cluster_id === clusterId && item.target_claim_id) {
+      return item.target_claim_id;
+    }
+    const affects = item.affects_claim_ids || [];
+    if (item.target_cluster_id === clusterId && affects.length) {
+      return affects[0];
+    }
+  }
+  return null;
+}
+
+async function loadCockpitQueue(body) {
+  const proj = encodeURIComponent(state.current);
+  const target = body.querySelector('[data-bind="cockpit-queue"]');
+  const filterBar = body.querySelector('[data-bind="cockpit-queue-filters"]');
+  const countsEl = body.querySelector('[data-bind="cockpit-queue-counts"]');
+  try {
+    const data = await fetchJSON(
+      `/api/projects/${proj}/cockpit-queue?voice=${encodeURIComponent(_cockpitVoice())}`);
+    state.cockpit.queue = data.items || [];
+    state.cockpit.sources = data.sources || {};
+    state.cockpit.counts = data.counts || {};
+    if (countsEl) {
+      const n = data.counts?.total || 0;
+      countsEl.textContent = n
+        ? `${n} item${n === 1 ? "" : "s"}`
+        : "all clear";
+    }
+    renderCockpitQueueFilters(filterBar, body);
+    renderCockpitQueueList(target, body);
+  } catch (err) {
+    target.innerHTML = `<div class="cockpit-pane-body empty" style="padding:24px;">Failed to load queue: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function renderCockpitQueueFilters(filterBar, body) {
+  if (!filterBar) return;
+  const counts = state.cockpit.counts?.by_kind || {};
+  const filters = [
+    {key: "all",            label: "All",         count: state.cockpit.queue.length},
+    {key: "audit_flag",     label: "Audit",       count: counts.audit_flag || 0},
+    {key: "lit_gap",        label: "Lit gaps",    count: counts.lit_gap || 0},
+    {key: "restructure",    label: "Restructure", count: counts.restructure || 0},
+    {key: "review_proposal",label: "Review",      count: counts.review_proposal || 0},
+  ];
+  filterBar.innerHTML = filters
+    .map(f => `<button data-filter="${escapeAttr(f.key)}"
+                       class="${state.cockpit.activeFilter === f.key ? "active" : ""}"
+                       ${f.count === 0 && f.key !== "all" ? "disabled" : ""}>
+                 ${escapeHtml(f.label)} <span class="muted">${f.count}</span>
+               </button>`)
+    .join("");
+  filterBar.querySelectorAll("button[data-filter]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      state.cockpit.activeFilter = btn.dataset.filter;
+      renderCockpitQueueFilters(filterBar, body);
+      const target = body.querySelector('[data-bind="cockpit-queue"]');
+      renderCockpitQueueList(target, body);
+    });
+  });
+}
+
+function renderCockpitQueueList(target, body) {
+  if (!target) return;
+  const items = state.cockpit.queue.filter(it =>
+    state.cockpit.activeFilter === "all" || it.kind === state.cockpit.activeFilter);
+  if (!items.length) {
+    const sources = state.cockpit.sources || {};
+    const anyMissing = Object.values(sources).every(v => v === "missing");
+    target.innerHTML = `<div class="cockpit-pane-body empty" style="padding:24px;">
+      ${anyMissing
+        ? "Nothing run yet. Run <strong>Refine</strong>, <strong>Find gaps</strong>, <strong>Restructure</strong>, or <strong>Review</strong> from the Activities tab to populate this queue."
+        : "Nothing in this filter."}
+    </div>`;
+    return;
+  }
+  target.innerHTML = `<ul class="cockpit-queue-list">
+    ${items.map(it => `
+      <li class="cockpit-queue-item severity-${escapeAttr(it.severity)} ${state.cockpit.selectedItemId === it.id ? "selected" : ""}"
+          data-item-id="${escapeAttr(it.id)}"
+          data-claim-id="${escapeAttr(it.target_claim_id || "")}"
+          data-cluster-id="${escapeAttr(it.target_cluster_id || "")}"
+          data-section-id="${escapeAttr(it.target_section_id || "")}">
+        <span class="severity-stripe"></span>
+        <div>
+          <div class="item-title">${escapeHtml(it.title || it.kind)}</div>
+          <div class="item-body">${escapeHtml(it.body || it.suggestion || "")}</div>
+          <div class="item-meta">
+            <span class="item-kind">${escapeHtml(it.kind)}</span>
+            ${it.target_cluster_id ? `<span class="item-kind">${escapeHtml(it.target_cluster_id)}</span>` : ""}
+          </div>
+        </div>
+        <span class="muted small">→</span>
+      </li>`).join("")}
+  </ul>`;
+  target.querySelectorAll(".cockpit-queue-item").forEach(el => {
+    el.addEventListener("click", () => {
+      state.cockpit.selectedItemId = el.dataset.itemId;
+      state.cockpit.selectedClaimId = el.dataset.claimId || null;
+      state.cockpit.selectedClusterId = el.dataset.clusterId || null;
+      // Re-render the queue to update selected highlight, then load
+      // the claim detail (if a claim is bound) into the evidence pane.
+      renderCockpitQueueList(target, body);
+      if (state.cockpit.selectedClaimId) {
+        loadCockpitClaim(body, state.cockpit.selectedClaimId);
+      } else {
+        // Items targeted at a cluster but no specific claim: surface
+        // the queue item itself in the evidence pane so the user can
+        // still act on it.
+        renderCockpitItemDetail(body, state.cockpit.queue.find(
+          i => i.id === state.cockpit.selectedItemId));
+      }
+      // Phase 6 — push the selection over to the graph iframe so
+      // the corresponding node gets the selected-from-parent ring.
+      const iframe = body.querySelector('[data-bind="cockpit-map"]');
+      if (iframe && state.cockpit.selectedClaimId) {
+        try {
+          iframe.contentWindow?.postMessage({
+            type: "lattice:select-claim",
+            claim_id: state.cockpit.selectedClaimId,
+          }, "*");
+        } catch (e) { /* same-origin guard */ }
+      }
+    });
+  });
+}
+
+async function loadCockpitClaim(body, claimId) {
+  const proj = encodeURIComponent(state.current);
+  const target = body.querySelector('[data-bind="cockpit-claim"]');
+  const meta = body.querySelector('[data-bind="cockpit-claim-meta"]');
+  target.innerHTML = `<div class="muted small">Loading claim…</div>`;
+  try {
+    const data = await fetchJSON(
+      `/api/projects/${proj}/cockpit-claim/${encodeURIComponent(claimId)}?voice=${encodeURIComponent(_cockpitVoice())}`);
+    if (meta) {
+      meta.textContent = data.section
+        ? `${data.section.title || data.section.section_id}`
+        : "";
+    }
+    renderCockpitClaimDetail(target, data);
+  } catch (err) {
+    target.innerHTML = `<div class="cockpit-pane-body empty" style="padding:0;">Could not load claim: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function renderCockpitClaimDetail(target, data) {
+  const claim = data.claim || {};
+  const section = data.section || {};
+  const cluster = data.cluster || {};
+  const flags = data.audit_flags || [];
+  const evidence = claim.evidence || [];
+  const actions = data.available_actions || [];
+  target.innerHTML = `
+    <div class="cockpit-claim-block">
+      <p class="cockpit-claim-statement">${escapeHtml(claim.statement || "")}</p>
+      <div class="cockpit-claim-meta">
+        <span class="pill">${escapeHtml(claim.type || "")}</span>
+        ${claim.author_origin ? `<span class="pill ok">author</span>` : ""}
+        <span class="pill">${escapeHtml(section.title || section.section_id || "—")}</span>
+        ${cluster.cluster_id ? `<span class="pill">cluster ${escapeHtml(cluster.cluster_id)}</span>` : ""}
+        <span class="pill">importance ${(claim.importance || 0).toFixed(2)}</span>
+      </div>
+      ${claim.mechanism ? `<p class="muted small"><strong>mechanism:</strong> ${escapeHtml(claim.mechanism)}</p>` : ""}
+      ${claim.scope_conditions?.length ? `<p class="muted small"><strong>scope:</strong> ${claim.scope_conditions.map(escapeHtml).join("; ")}</p>` : ""}
+    </div>
+    ${data.rendered_paragraph
+      ? `<div class="cockpit-claim-block">
+          <h4 class="muted small" style="text-transform:uppercase; margin:0 0 4px; letter-spacing:0.04em;">Rendered paragraph</h4>
+          <div class="cockpit-claim-paragraph">${escapeHtml(data.rendered_paragraph.trim())}</div>
+        </div>`
+      : `<div class="cockpit-claim-block muted small">No rendered paragraph — cluster not yet drafted.</div>`}
+    <div class="cockpit-claim-block">
+      <h4 class="muted small" style="text-transform:uppercase; margin:0 0 6px; letter-spacing:0.04em;">Evidence (${evidence.length})</h4>
+      ${evidence.length
+        ? evidence.map(ev => `
+            <div class="cockpit-evidence-row">
+              <span><strong>${escapeHtml(ev.source || "?")}</strong>
+                ${ev.passage ? `<span class="muted small">· ${escapeHtml(ev.passage)}</span>` : ""}
+              </span>
+              <span class="pill">${escapeHtml(ev.binding_strength || "?")}</span>
+            </div>`).join("")
+        : `<div class="muted small">No bound evidence on this claim.</div>`}
+    </div>
+    ${flags.length ? `
+      <div class="cockpit-claim-block">
+        <h4 class="muted small" style="text-transform:uppercase; margin:0 0 6px; letter-spacing:0.04em;">Audit flags on this cluster (${flags.length})</h4>
+        ${flags.slice(0, 6).map(f => `
+          <div class="cockpit-evidence-row">
+            <span><strong>${escapeHtml(f.rule_id || "")}</strong>
+              <span class="muted small">${escapeHtml((f.offending_text || "").slice(0, 80))}</span>
+            </span>
+            <span class="pill ${f.severity === "critical" ? "bad" : f.severity === "minor" ? "" : "warn"}">${escapeHtml(f.severity || "")}</span>
+          </div>`).join("")}
+      </div>` : ""}
+    <div class="cockpit-action-row" data-bind="cockpit-actions">
+      ${actions.map(a => `
+        <button data-action="${escapeAttr(a)}"
+                data-claim-id="${escapeAttr(claim.claim_id || "")}"
+                data-cluster-id="${escapeAttr(cluster.cluster_id || "")}"
+                ${a === "redraft-cluster" ? "class=\"primary\"" : ""}>
+          ${escapeHtml(actionLabel(a))}
+        </button>`).join("")}
+    </div>`;
+  wireCockpitActions(target);
+}
+
+function renderCockpitItemDetail(body, item) {
+  const target = body.querySelector('[data-bind="cockpit-claim"]');
+  if (!target || !item) return;
+  target.innerHTML = `
+    <div class="cockpit-claim-block">
+      <p class="cockpit-claim-statement">${escapeHtml(item.title || "")}</p>
+      <div class="cockpit-claim-meta">
+        <span class="pill">${escapeHtml(item.kind)}</span>
+        <span class="pill ${item.severity === "critical" ? "bad" : item.severity === "info" ? "" : "warn"}">${escapeHtml(item.severity)}</span>
+        ${item.target_section_id ? `<span class="pill">section ${escapeHtml(item.target_section_id)}</span>` : ""}
+        ${item.target_cluster_id ? `<span class="pill">cluster ${escapeHtml(item.target_cluster_id)}</span>` : ""}
+      </div>
+      ${item.body ? `<p>${escapeHtml(item.body)}</p>` : ""}
+      ${item.suggestion ? `
+        <div class="cockpit-claim-paragraph">${escapeHtml(item.suggestion)}</div>` : ""}
+    </div>
+    <div class="cockpit-action-row" data-bind="cockpit-actions">
+      ${(item.actions || []).map(a => `
+        <button data-action="${escapeAttr(a)}"
+                data-cluster-id="${escapeAttr(item.target_cluster_id || "")}">
+          ${escapeHtml(actionLabel(a))}
+        </button>`).join("")}
+    </div>`;
+  wireCockpitActions(target);
+}
+
+function actionLabel(action) {
+  return ({
+    "add-source": "Add source",
+    "edit-claim": "Edit claim",
+    "split-claim": "Split claim",
+    "merge-claim": "Merge claim",
+    "redraft-cluster": "Redraft cluster",
+    "mark-intentional": "Mark intentional",
+  })[action] || action;
+}
+
+function wireCockpitActions(target) {
+  target.querySelectorAll("[data-action]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const action = btn.dataset.action;
+      const proj = encodeURIComponent(state.current);
+      const payload = {
+        claim_id: btn.dataset.claimId || null,
+        cluster_id: btn.dataset.clusterId || null,
+        voice: _cockpitVoice(),
+      };
+      try {
+        const resp = await fetch(
+          `/api/projects/${proj}/cockpit/actions/${encodeURIComponent(action)}`,
+          {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(payload),
+          });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.status === 501) {
+          const detail = data.detail || data;
+          showCockpitToast(
+            `“${actionLabel(action)}” is a Phase 3 stub — ${detail.next_phase || "wires up in a later phase."}`);
+        } else if (!resp.ok) {
+          showCockpitToast(`Action failed: ${resp.status} ${resp.statusText}`);
+        } else {
+          showCockpitToast(`${actionLabel(action)}: ${data.status || "done"}`);
+        }
+      } catch (err) {
+        showCockpitToast(`Network error: ${err.message}`);
+      }
+    });
+  });
+}
+
+function showCockpitToast(message) {
+  document.querySelectorAll(".cockpit-toast").forEach(t => t.remove());
+  const el = document.createElement("div");
+  el.className = "cockpit-toast";
+  el.textContent = message;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+
+// ════════════════════════════════════════════════════════════
+// History — Phase 7 snapshot list + revert.
+//
+// Shows every snapshot taken (one per major activity, plus
+// pre-revert snapshots and any manual saves) newest-first. Each
+// row offers "Diff vs current" and "Revert". Reverting always
+// takes a pre-revert snapshot first so the action is itself
+// recoverable.
+// ════════════════════════════════════════════════════════════
+
+const SNAPSHOT_KIND_LABELS = {
+  manual: "Manual save",
+  before_ingest: "Before Ingest",
+  before_scaffold: "Before Scaffold",
+  before_draft: "Before Draft",
+  before_find_gaps: "Before Find gaps",
+  before_refine: "Before Refine",
+  before_restructure: "Before Restructure",
+  before_review: "Before Review",
+  before_redraft: "Before Redraft",
+  pre_revert: "Pre-revert",
+};
+
+async function renderHistorySubview(body) {
+  const proj = encodeURIComponent(state.current);
+  body.innerHTML = `
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+        <h3 class="subhead" style="margin:0;">Snapshots</h3>
+        <button class="btn sm" data-action="snapshot-now">+ Save snapshot</button>
+      </div>
+      <div data-bind="snapshots-list" class="muted small">Loading…</div>
+    </div>
+    <div class="card hidden" data-bind="snapshot-diff" style="margin-top:12px;"></div>`;
+  const listEl = body.querySelector('[data-bind="snapshots-list"]');
+  const diffEl = body.querySelector('[data-bind="snapshot-diff"]');
+
+  body.querySelector('[data-action="snapshot-now"]').addEventListener("click", async () => {
+    const message = window.prompt("Snapshot message (optional):", "");
+    if (message === null) return;
+    try {
+      const resp = await fetch(`/api/projects/${proj}/snapshots`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({message: message || "Manual snapshot"}),
+      });
+      if (!resp.ok) {
+        showCockpitToast(`Snapshot failed: ${resp.status}`);
+        return;
+      }
+      showCockpitToast("Snapshot saved.");
+      renderHistorySubview(body); // refresh
+    } catch (err) {
+      showCockpitToast(`Network error: ${err.message}`);
+    }
+  });
+
+  let data;
+  try {
+    data = await fetchJSON(`/api/projects/${proj}/snapshots`);
+  } catch (err) {
+    listEl.innerHTML = `<p class="muted small">Failed to load snapshots: ${escapeHtml(err.message)}</p>`;
+    return;
+  }
+  if (!data.snapshots.length) {
+    listEl.innerHTML = `
+      <p class="muted small">No snapshots yet — they're taken automatically before each activity. Run an activity from the Activities tab, or click "+ Save snapshot" above to checkpoint manually.</p>`;
+    return;
+  }
+  listEl.innerHTML = `<ul class="cockpit-queue-list">
+    ${data.snapshots.map(s => `
+      <li class="cockpit-queue-item severity-info" data-snap-id="${escapeAttr(s.snapshot_id)}">
+        <span class="severity-stripe"></span>
+        <div>
+          <div class="item-title">${escapeHtml(SNAPSHOT_KIND_LABELS[s.kind] || s.kind)}</div>
+          <div class="item-body">
+            ${escapeHtml(s.message || "(no message)")}
+          </div>
+          <div class="item-meta">
+            <span class="item-kind">${escapeHtml(s.actor)}</span>
+            <span class="item-kind">${escapeHtml(formatTimestamp(new Date(s.created_at).getTime() / 1000))}</span>
+            <span class="item-kind">${s.cluster_count} clusters · ${s.source_count} sources</span>
+          </div>
+        </div>
+        <div style="display:flex; gap:6px; flex-direction:column;">
+          <button class="btn sm" data-action="diff" data-snap-id="${escapeAttr(s.snapshot_id)}">Diff vs current</button>
+          <button class="btn sm" data-action="revert" data-snap-id="${escapeAttr(s.snapshot_id)}">Revert</button>
+        </div>
+      </li>`).join("")}
+  </ul>`;
+
+  listEl.querySelectorAll('[data-action="diff"]').forEach(btn => {
+    btn.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      const snapId = btn.dataset.snapId;
+      diffEl.classList.remove("hidden");
+      diffEl.innerHTML = `<p class="muted small">Loading diff…</p>`;
+      try {
+        const resp = await fetchJSON(
+          `/api/projects/${proj}/snapshots/${encodeURIComponent(snapId)}/diff`);
+        diffEl.innerHTML = renderSnapshotDiff(snapId, resp.diff);
+      } catch (err) {
+        diffEl.innerHTML = `<p class="muted small">Diff failed: ${escapeHtml(err.message)}</p>`;
+      }
+    });
+  });
+
+  listEl.querySelectorAll('[data-action="revert"]').forEach(btn => {
+    btn.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      const snapId = btn.dataset.snapId;
+      if (!window.confirm(
+        `Revert project to snapshot "${snapId}"?\n\n` +
+        `A pre-revert snapshot will be taken first so this is recoverable.`)) return;
+      try {
+        const resp = await fetch(
+          `/api/projects/${proj}/snapshots/${encodeURIComponent(snapId)}/revert`,
+          {method: "POST"});
+        if (!resp.ok) {
+          showCockpitToast(`Revert failed: ${resp.status}`);
+          return;
+        }
+        showCockpitToast(`Reverted to ${snapId}. Refreshing…`);
+        // Re-render the History view + reload the project so the
+        // dashboard / cockpit see the restored state.
+        setTimeout(() => location.reload(), 800);
+      } catch (err) {
+        showCockpitToast(`Network error: ${err.message}`);
+      }
+    });
+  });
+}
+
+function renderSnapshotDiff(snapId, diff) {
+  const total = diff.total_changes || 0;
+  if (!total) {
+    return `<p class="muted small">No structural changes between
+      <code>${escapeHtml(snapId)}</code> and current state.</p>`;
+  }
+  const row = (label, items) =>
+    items && items.length
+      ? `<div class="kv"><span class="k">${escapeHtml(label)}</span>
+          <span class="v">${items.length} (${items.slice(0, 6).map(escapeHtml).join(", ")}${items.length > 6 ? "…" : ""})</span></div>`
+      : "";
+  return `
+    <h3 class="subhead">Diff: <code>${escapeHtml(snapId)}</code> → current</h3>
+    <p class="muted small">${total} structural change${total === 1 ? "" : "s"}.</p>
+    <div class="kv-list">
+      ${row("Sections added",        diff.sections_added)}
+      ${row("Sections removed",      diff.sections_removed)}
+      ${row("Claims added",          diff.claims_added)}
+      ${row("Claims removed",        diff.claims_removed)}
+      ${diff.claims_modified?.length
+        ? `<div class="kv"><span class="k">Claims modified</span><span class="v">${diff.claims_modified.length} (${diff.claims_modified.slice(0, 6).map(c => escapeHtml(c.claim_id)).join(", ")}${diff.claims_modified.length > 6 ? "…" : ""})</span></div>`
+        : ""}
+      ${row("Relationships added",   diff.relationships_added)}
+      ${row("Relationships removed", diff.relationships_removed)}
+      ${row("Sources added",         diff.sources_added)}
+      ${row("Sources removed",       diff.sources_removed)}
+      ${row("Clusters added",        diff.clusters_added)}
+      ${row("Clusters removed",      diff.clusters_removed)}
+      ${row("Clusters modified",     diff.clusters_modified)}
+    </div>`;
 }
 
 

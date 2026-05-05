@@ -146,6 +146,10 @@ class ActivityStartRequest(BaseModel):
     chunk_max: int = 4                  # draft only
     force: bool = False                 # draft only
     nesting_depth: int = 2              # scaffold only — 1=flat, 2=##, 3=###
+    # Phase 5/7: optional redraft mode for the draft activity. When
+    # set, the renderer uses the matching system-prompt prelude and
+    # the dispatcher enforces claim preservation after the render.
+    redraft_mode: str | None = None     # draft only
 
 
 class ActivityStartResponse(BaseModel):
@@ -255,6 +259,63 @@ def create_app(projects_root: Path | None = None) -> FastAPI:
         if not path.exists() or not (path / ".lattice").exists():
             raise HTTPException(404, f"Project not found: {name}")
         return path
+
+    def _count_by(items: list[dict[str, Any]], key: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for it in items:
+            v = it.get(key) or "unknown"
+            counts[v] = counts.get(v, 0) + 1
+        return counts
+
+    def _proposal_decisions_path(project_path: Path, voice: str) -> Path:
+        return (
+            project_path / ".lattice"
+            / f"proposal_decisions.{voice}.json"
+        )
+
+    def _read_proposal_decisions(
+        project_path: Path, voice: str,
+    ) -> dict[str, dict[str, Any]]:
+        """Read the proposal-decision log keyed by ``proposal_id``.
+        Tolerates a missing or malformed file."""
+        target = _proposal_decisions_path(project_path, voice)
+        if not target.exists():
+            return {}
+        try:
+            data = json.loads(target.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        decisions = data.get("decisions") if isinstance(data.get("decisions"), list) else []
+        return {d["proposal_id"]: d for d in decisions if isinstance(d, dict) and d.get("proposal_id")}
+
+    def _write_proposal_decision(
+        project_path: Path, voice: str, decision: dict[str, Any],
+    ) -> None:
+        target = _proposal_decisions_path(project_path, voice)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        existing: dict[str, Any] = {"voice": voice, "decisions": []}
+        if target.exists():
+            try:
+                loaded = json.loads(target.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing = loaded
+                    existing.setdefault("decisions", [])
+                    if not isinstance(existing["decisions"], list):
+                        existing["decisions"] = []
+            except json.JSONDecodeError:
+                pass
+        # Replace any prior decision with the same proposal_id so
+        # accept→reject (or vice versa) overrides cleanly without
+        # leaving stale records.
+        prior = existing["decisions"]
+        existing["decisions"] = [
+            d for d in prior
+            if not (isinstance(d, dict) and d.get("proposal_id") == decision.get("proposal_id"))
+        ]
+        existing["decisions"].append(decision)
+        target.write_text(json.dumps(existing, indent=2), encoding="utf-8")
 
     # ─── projects ──────────────────────────────
 
@@ -698,6 +759,7 @@ def create_app(projects_root: Path | None = None) -> FastAPI:
             chunk_max=body.chunk_max,
             force=body.force,
             nesting_depth=nesting,
+            redraft_mode=body.redraft_mode,
         )
         state = _RunState(run_id, request)
         _RUNS[run_id] = state
@@ -806,8 +868,10 @@ def create_app(projects_root: Path | None = None) -> FastAPI:
     # ─── outputs ──────────────────────────────
 
     @app.get("/api/projects/{name}/paper")
-    async def get_paper(name: str) -> PlainTextResponse:
-        path = _project_path(name) / "outputs" / "paper.academic.md"
+    async def get_paper(
+        name: str, voice: str = "academic",
+    ) -> PlainTextResponse:
+        path = _project_path(name) / "outputs" / f"paper.{voice}.md"
         if not path.exists():
             raise HTTPException(404, "No rendered paper.")
         return PlainTextResponse(path.read_text(encoding="utf-8"))
@@ -891,6 +955,495 @@ def create_app(projects_root: Path | None = None) -> FastAPI:
         if not path.exists():
             raise HTTPException(404, "No voice review.")
         return PlainTextResponse(path.read_text(encoding="utf-8"))
+
+    # ─── revision cockpit (Phase 3) ────────────────
+    #
+    # The cockpit gathers every actionable signal — audit flags, lit
+    # gaps, restructure suggestions, supervisor review revisions —
+    # into one queue keyed by (cluster_id, claim_id) so the frontend
+    # can present a single working surface instead of four scattered
+    # panels. See lattice/docs/IMPLEMENTATION_PLAN.md Phase 3.
+
+    @app.get("/api/projects/{name}/cockpit-queue")
+    async def get_cockpit_queue(
+        name: str, voice: str = "academic",
+    ) -> dict[str, Any]:
+        """Merge audit, lit-gaps, restructure, and review outputs into
+        one chronological action queue the cockpit can render.
+
+        Each item carries enough metadata for the cockpit to:
+          - sort/filter by ``kind`` and ``severity``
+          - resolve a target ``cluster_id`` / ``claim_id`` / ``section_id``
+            so clicking an item selects the right element in the paper
+            preview, argument map, and evidence panes
+          - offer an action set the cockpit knows how to dispatch.
+
+        This endpoint never errors when an artefact is missing — it
+        just returns whatever queues do exist. The frontend distinguishes
+        "nothing to do" from "nothing run yet" via the ``sources`` map.
+        """
+        path = _project_path(name)
+        items: list[dict[str, Any]] = []
+        sources: dict[str, str] = {
+            "audit": "missing",
+            "lit_gaps": "missing",
+            "restructure": "missing",
+            "review": "missing",
+        }
+
+        # 1. Audit flags ─────────────────────────────
+        audit_path = path / ".lattice" / "audit_flags.json"
+        if audit_path.exists():
+            try:
+                audit_data = json.loads(audit_path.read_text(encoding="utf-8"))
+                if isinstance(audit_data, dict):
+                    flags_for_voice = audit_data.get(voice, []) or []
+                else:
+                    flags_for_voice = audit_data if isinstance(audit_data, list) else []
+                sources["audit"] = "present" if flags_for_voice else "empty"
+                for i, flag in enumerate(flags_for_voice):
+                    if not isinstance(flag, dict):
+                        continue
+                    items.append({
+                        "id": f"audit:{flag.get('flag_id') or i}",
+                        "kind": "audit_flag",
+                        "severity": flag.get("severity") or "standard",
+                        "title": flag.get("rule_id") or "audit flag",
+                        "body": flag.get("offending_text") or "",
+                        "suggestion": flag.get("suggestion") or "",
+                        "category": flag.get("category") or "",
+                        "target_section_id": flag.get("section_id"),
+                        "target_cluster_id": flag.get("cluster_id"),
+                        "target_claim_id": None,
+                        "actions": ["redraft-cluster", "edit-claim", "mark-intentional"],
+                        "raw": flag,
+                    })
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # 2. Lit-gaps ────────────────────────────────
+        gaps_path = path / "outputs" / f"lit_gaps.{voice}.json"
+        if gaps_path.exists():
+            try:
+                gaps_data = json.loads(gaps_path.read_text(encoding="utf-8"))
+                section_gaps = gaps_data.get("sections", []) if isinstance(gaps_data, dict) else []
+                total = 0
+                for sec in section_gaps:
+                    if not isinstance(sec, dict):
+                        continue
+                    sid = sec.get("section_id") or ""
+                    for j, g in enumerate(sec.get("suggestions", []) or []):
+                        if not isinstance(g, dict):
+                            continue
+                        total += 1
+                        claim_ids = g.get("claim_ids") or []
+                        target_claim = claim_ids[0] if claim_ids else None
+                        items.append({
+                            "id": f"lit_gap:{sid}:{j}",
+                            "kind": "lit_gap",
+                            "severity": "info",
+                            "title": (
+                                f"Missing: {g.get('author', '?')}"
+                                + (f" ({g.get('year')})" if g.get("year") else "")
+                            ),
+                            "body": g.get("work") or "",
+                            "suggestion": g.get("why_relevant") or "",
+                            "category": g.get("kind") or "canonical",
+                            "target_section_id": sid,
+                            "target_cluster_id": None,
+                            "target_claim_id": target_claim,
+                            "actions": ["add-source", "edit-claim"],
+                            "raw": g,
+                        })
+                sources["lit_gaps"] = "present" if total else "empty"
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # 3. Restructure suggestions ─────────────────
+        restructure_path = path / "outputs" / f"restructure.{voice}.json"
+        if restructure_path.exists():
+            try:
+                rdata = json.loads(restructure_path.read_text(encoding="utf-8"))
+                suggs = rdata.get("suggestions", []) if isinstance(rdata, dict) else []
+                sources["restructure"] = "present" if suggs else "empty"
+                for k, s in enumerate(suggs):
+                    if not isinstance(s, dict):
+                        continue
+                    target_id = s.get("target_id") or ""
+                    target_section_id = target_id if target_id.startswith("s.") else None
+                    target_cluster_id = target_id if target_id.startswith("c.") else None
+                    target_claim_id = target_id if target_id.startswith("cl.") else None
+                    items.append({
+                        "id": f"restructure:{k}",
+                        "kind": "restructure",
+                        "severity": "info",
+                        "title": f"Restructure: {s.get('kind') or 'move'}",
+                        "body": s.get("rationale") or s.get("rule") or "",
+                        "suggestion": s.get("rule") or "",
+                        "category": s.get("kind") or "",
+                        "target_section_id": target_section_id,
+                        "target_cluster_id": target_cluster_id,
+                        "target_claim_id": target_claim_id,
+                        "actions": ["edit-claim", "split-claim", "merge-claim"],
+                        "raw": s,
+                    })
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # 4. Supervisor review proposals ─────────────
+        # Phase 5: prefer the structured ``proposals`` list (typed,
+        # graph-aware accept/reject items). Fall back to
+        # ``cluster_revisions`` for reports written before Phase 5 so
+        # old projects still surface review items.
+        review_path = path / "outputs" / f"review.{voice}.json"
+        review_decisions = _read_proposal_decisions(path, voice)
+        if review_path.exists():
+            try:
+                rev_data = json.loads(review_path.read_text(encoding="utf-8"))
+                _sev_map = {"nit": "minor", "suggestion": "standard", "concern": "critical"}
+                proposals = rev_data.get("proposals", []) if isinstance(rev_data, dict) else []
+                if proposals:
+                    sources["review"] = "present"
+                    for p in proposals:
+                        if not isinstance(p, dict):
+                            continue
+                        proposal_id = p.get("proposal_id") or ""
+                        decision = review_decisions.get(proposal_id, {})
+                        decided = decision.get("decision")
+                        # Hide accepted/rejected proposals from the
+                        # active queue once decided. Phase 7 will let
+                        # the cockpit re-surface them via a "decided"
+                        # filter; for now they drop out cleanly.
+                        if decided in ("accepted", "rejected"):
+                            continue
+                        target_claim_id = (
+                            p.get("affects_claim_ids", [])[0]
+                            if p.get("affects_claim_ids") else None
+                        )
+                        items.append({
+                            "id": f"review:{proposal_id or len(items)}",
+                            "kind": "review_proposal",
+                            "severity": _sev_map.get(p.get("severity") or "", "standard"),
+                            "title": (
+                                f"Review ({p.get('kind') or 'other'}): "
+                                f"{p.get('section_id') or 'cluster'}"
+                            ),
+                            "body": p.get("comment") or "",
+                            "suggestion": p.get("after_text") or "",
+                            "category": p.get("kind") or "other",
+                            "target_section_id": p.get("section_id"),
+                            "target_cluster_id": p.get("cluster_id"),
+                            "target_claim_id": target_claim_id,
+                            "affects_claim_ids": p.get("affects_claim_ids", []),
+                            "affects_source_ids": p.get("affects_source_ids", []),
+                            "affects_relationship_ids": p.get("affects_relationship_ids", []),
+                            "actions": [
+                                "accept-proposal", "reject-proposal",
+                                "redraft-cluster", "edit-claim",
+                            ],
+                            "raw": p,
+                        })
+                else:
+                    # Backwards-compat path: pre-Phase-5 reports only
+                    # have cluster_revisions. Surface them with the old
+                    # action set so legacy projects still see review
+                    # items in the cockpit.
+                    revs = rev_data.get("cluster_revisions", []) if isinstance(rev_data, dict) else []
+                    sources["review"] = "present" if revs else "empty"
+                    for m, rev in enumerate(revs):
+                        if not isinstance(rev, dict):
+                            continue
+                        items.append({
+                            "id": f"review:{m}",
+                            "kind": "review_proposal",
+                            "severity": _sev_map.get(rev.get("severity") or "", "standard"),
+                            "title": f"Review: {rev.get('section_title') or rev.get('section_id') or 'cluster'}",
+                            "body": rev.get("comment") or "",
+                            "suggestion": rev.get("revised_prose") or "",
+                            "category": rev.get("severity") or "suggestion",
+                            "target_section_id": rev.get("section_id"),
+                            "target_cluster_id": rev.get("cluster_id"),
+                            "target_claim_id": None,
+                            "actions": ["redraft-cluster", "edit-claim", "mark-intentional"],
+                            "raw": rev,
+                        })
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Sort: critical → standard → minor → info, stable on insertion.
+        _sev_order = {"critical": 0, "standard": 1, "minor": 2, "info": 3}
+        items.sort(key=lambda it: _sev_order.get(it.get("severity") or "info", 3))
+
+        return {
+            "voice": voice,
+            "items": items,
+            "sources": sources,
+            "counts": {
+                "total": len(items),
+                "by_kind": _count_by(items, "kind"),
+                "by_severity": _count_by(items, "severity"),
+            },
+        }
+
+    @app.get("/api/projects/{name}/cockpit-claim/{claim_id}")
+    async def get_cockpit_claim(
+        name: str, claim_id: str, voice: str = "academic",
+    ) -> dict[str, Any]:
+        """Return the union of data the cockpit's evidence + claim
+        panes need for a single claim:
+
+          - the Claim itself (statement, type, importance, evidence,
+            mechanism, scope, tags)
+          - its Section + Cluster context
+          - the rendered prose paragraph from
+            ``.lattice/drafts/<voice>/cluster_<id>.md`` (or empty if
+            not yet rendered)
+          - the audit flags whose cluster_id matches
+          - the available action set for this claim's state
+        """
+        path = _project_path(name)
+        store = GraphStore.load(path)
+        graph = store.get_graph()
+        claim = next((c for c in graph.claims if c.claim_id == claim_id), None)
+        if claim is None:
+            raise HTTPException(404, f"Claim not found: {claim_id}")
+        section = next(
+            (s for s in graph.sections if s.section_id == claim.section_id),
+            None,
+        )
+        cluster = None
+        for c in store.list_clusters():
+            for entry in c.claim_sequence:
+                if entry.claim_id == claim_id:
+                    cluster = c
+                    break
+            if cluster:
+                break
+
+        rendered_paragraph = ""
+        if cluster is not None:
+            prose_path = (
+                path / ".lattice" / "drafts" / voice
+                / f"cluster_{cluster.cluster_id}.md"
+            )
+            if prose_path.exists():
+                try:
+                    rendered_paragraph = prose_path.read_text(encoding="utf-8")
+                except OSError:
+                    rendered_paragraph = ""
+
+        audit_path = path / ".lattice" / "audit_flags.json"
+        flags_for_cluster: list[dict[str, Any]] = []
+        if cluster is not None and audit_path.exists():
+            try:
+                audit_data = json.loads(audit_path.read_text(encoding="utf-8"))
+                if isinstance(audit_data, dict):
+                    pool = audit_data.get(voice, []) or []
+                else:
+                    pool = audit_data if isinstance(audit_data, list) else []
+                for f in pool:
+                    if isinstance(f, dict) and f.get("cluster_id") == cluster.cluster_id:
+                        flags_for_cluster.append(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        return {
+            "claim": claim.model_dump(mode="json"),
+            "section": section.model_dump(mode="json") if section else None,
+            "cluster": cluster.model_dump(mode="json") if cluster else None,
+            "rendered_paragraph": rendered_paragraph,
+            "audit_flags": flags_for_cluster,
+            "available_actions": [
+                "add-source", "edit-claim", "split-claim",
+                "merge-claim", "redraft-cluster", "mark-intentional",
+            ],
+        }
+
+    @app.post("/api/projects/{name}/cockpit/actions/{action}")
+    async def cockpit_action(
+        name: str, action: str, payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Cockpit action dispatcher.
+
+        Phase 5 lands real implementations for ``accept-proposal`` and
+        ``reject-proposal`` (write a decision log entry). The remaining
+        actions (``add-source``, ``edit-claim``, ``split-claim``,
+        ``merge-claim``, ``redraft-cluster``, ``mark-intentional``)
+        still return 501 with a structured payload; they land in
+        Phase 7 (provenance/versioning) and a follow-up rewrite pass.
+        """
+        valid = {
+            "add-source", "edit-claim", "split-claim",
+            "merge-claim", "redraft-cluster", "mark-intentional",
+            "accept-proposal", "reject-proposal",
+        }
+        if action not in valid:
+            raise HTTPException(400, f"Unknown cockpit action: {action}")
+        path = _project_path(name)
+        body = payload or {}
+
+        # ─── Phase 5 implementations ───
+        if action in ("accept-proposal", "reject-proposal"):
+            from datetime import datetime as _dt, timezone as _tz
+            proposal_id = (body.get("proposal_id") or "").strip()
+            if not proposal_id:
+                raise HTTPException(400, "Missing proposal_id in payload.")
+            voice = body.get("voice") or "academic"
+            decision = {
+                "proposal_id": proposal_id,
+                "cluster_id": body.get("cluster_id") or "",
+                "decision": (
+                    "accepted" if action == "accept-proposal" else "rejected"
+                ),
+                "decided_at": _dt.now(_tz.utc).isoformat(),
+                "decided_by": body.get("decided_by") or "user",
+                "rationale": body.get("rationale") or "",
+            }
+            _write_proposal_decision(path, voice, decision)
+            return {
+                "status": "ok",
+                "action": action,
+                "proposal_id": proposal_id,
+                "decision": decision["decision"],
+            }
+
+        # ─── still-stub actions ───
+        raise HTTPException(
+            501,
+            detail={
+                "status": "not_implemented",
+                "action": action,
+                "next_phase": (
+                    "Phase 5 wires accept/reject for review proposals; "
+                    "Phase 7 (provenance) lands edit/split/merge/redraft "
+                    "and source addition with full audit trail."
+                ),
+                "received_payload": body,
+            },
+        )
+
+    # ─── snapshots (Phase 7) ─────────────────────────
+    #
+    # Endpoints for listing, inspecting, diffing, and reverting
+    # snapshots. Activities take a snapshot before they run; users
+    # see the chain in the cockpit's History view and can revert
+    # any of them. See lattice/docs/IMPLEMENTATION_PLAN.md Phase 7.
+
+    @app.get("/api/projects/{name}/snapshots")
+    async def list_snapshots(name: str) -> dict[str, Any]:
+        """Return every snapshot for the project, newest first.
+        Heavy fields (graph, clusters, sources, audit_flags) are
+        stripped — the listing is a directory; the per-snapshot
+        endpoint serves the full bundle."""
+        path = _project_path(name)
+        store = GraphStore.load(path)
+        snapshots = store.list_snapshots()
+        return {
+            "snapshots": [
+                {
+                    "snapshot_id": s.snapshot_id,
+                    "kind": s.kind.value,
+                    "created_at": s.created_at.isoformat(),
+                    "actor": s.actor,
+                    "message": s.message,
+                    "graph_present": s.graph is not None,
+                    "cluster_count": len(s.clusters),
+                    "source_count": len(s.sources),
+                }
+                for s in snapshots
+            ],
+            "total": len(snapshots),
+        }
+
+    @app.get("/api/projects/{name}/snapshots/{snapshot_id}")
+    async def get_snapshot(name: str, snapshot_id: str) -> dict[str, Any]:
+        path = _project_path(name)
+        store = GraphStore.load(path)
+        try:
+            snapshot = store.load_snapshot(snapshot_id)
+        except KeyError:
+            raise HTTPException(404, f"Snapshot not found: {snapshot_id}")
+        return snapshot.model_dump(mode="json")
+
+    @app.get("/api/projects/{name}/snapshots/{snapshot_id}/diff")
+    async def diff_snapshot(
+        name: str, snapshot_id: str, against: str = "current",
+    ) -> dict[str, Any]:
+        """Return the structural diff between this snapshot and
+        either the current project state (default) or another named
+        snapshot via ``?against=<other_id>``."""
+        from ..differ.graph_diff import diff_graphs, diff_snapshots
+        path = _project_path(name)
+        store = GraphStore.load(path)
+        try:
+            before = store.load_snapshot(snapshot_id)
+        except KeyError:
+            raise HTTPException(404, f"Snapshot not found: {snapshot_id}")
+        if against == "current":
+            graph = store.get_graph() if store.author_graph_path.exists() else None
+            clusters = store._load_clusters()
+            sources = store.list_sources()
+            diff = diff_graphs(
+                before.graph, graph,
+                before_clusters=before.clusters, after_clusters=clusters,
+                before_sources=before.sources, after_sources=sources,
+            )
+            after_label = "current"
+        else:
+            try:
+                after = store.load_snapshot(against)
+            except KeyError:
+                raise HTTPException(404, f"Snapshot not found: {against}")
+            diff = diff_snapshots(before, after)
+            after_label = against
+        return {
+            "before": snapshot_id,
+            "after": after_label,
+            "diff": diff.model_dump(mode="json"),
+        }
+
+    @app.post("/api/projects/{name}/snapshots/{snapshot_id}/revert")
+    async def revert_snapshot(
+        name: str, snapshot_id: str,
+    ) -> dict[str, Any]:
+        """Restore project state to a snapshot. Always takes a
+        ``pre_revert`` snapshot first so the revert itself is
+        recoverable."""
+        path = _project_path(name)
+        store = GraphStore.load(path)
+        try:
+            restored = store.revert_to_snapshot(snapshot_id)
+        except KeyError:
+            raise HTTPException(404, f"Snapshot not found: {snapshot_id}")
+        return {
+            "status": "ok",
+            "restored": restored.snapshot_id,
+            "kind": restored.kind.value,
+            "created_at": restored.created_at.isoformat(),
+        }
+
+    @app.post("/api/projects/{name}/snapshots")
+    async def create_snapshot(
+        name: str, payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Take a manual snapshot. The cockpit exposes this as a
+        'Save snapshot' button so users can checkpoint before a
+        risky manual edit."""
+        from ..graph.models import SnapshotKind
+        path = _project_path(name)
+        store = GraphStore.load(path)
+        body = payload or {}
+        message = (body.get("message") or "").strip()
+        snapshot = store.create_snapshot(
+            kind=SnapshotKind.manual,
+            actor=body.get("actor") or "user",
+            message=message or "Manual snapshot",
+        )
+        return {
+            "status": "ok",
+            "snapshot_id": snapshot.snapshot_id,
+            "created_at": snapshot.created_at.isoformat(),
+        }
 
     @app.get("/api/projects/{name}/drafts")
     async def get_drafts(name: str) -> list[dict[str, Any]]:
@@ -1497,16 +2050,33 @@ def create_app(projects_root: Path | None = None) -> FastAPI:
         )
 
     @app.get("/api/projects/{name}/graph-viz")
-    async def get_graph_viz(name: str) -> FileResponse:
-        """Return the interactive argument-graph HTML. Regenerates
-        the cached file when ANY of these is newer than the HTML:
+    async def get_graph_viz(
+        name: str, voice: str | None = None, mode: str | None = None,
+    ) -> FileResponse:
+        """Return the interactive argument-graph HTML. The ``mode``
+        query parameter (Phase 6) is read client-side from
+        ``window.location.search`` and applied as a JS overlay, so
+        the HTML cache stays single-file across all map modes — no
+        regeneration needed when the user switches modes.
+
+        Regenerates the cached file when ANY of these is newer than
+        the HTML:
 
           - ``author_graph.json`` (relationships, claims changed)
           - ``cluster_plan.json`` (cluster boundaries / state changed)
           - ``source_store.json`` (evidence binding picture changed)
+          - any rendered cluster file under ``.lattice/drafts/<voice>/``
+            (so missing-claim and unrenderable markers refresh after a
+            re-render — the visualiser scans these files for marker
+            tokens to flag affected claims)
           - the latest audit / readiness JSON under ``.lattice/audit/``
             (so the diagram's badges and "blocks readiness" overlay
             stay in sync with what the auditor last decided)
+
+        ``voice`` selects which voice's drafts directory feeds the
+        unrenderable-marker check. When omitted, picks the first voice
+        subdirectory under ``.lattice/drafts/`` that contains rendered
+        clusters; falls back to no marker check at all.
 
         Also regenerates when the lattice version stamp embedded in
         the HTML doesn't match the current ``LATTICE_VERSION``, so
@@ -1516,6 +2086,25 @@ def create_app(projects_root: Path | None = None) -> FastAPI:
         path = _project_path(name)
         viz_path = path / "outputs" / "argument_graph.html"
         lattice_dir = path / ".lattice"
+
+        # Resolve the voice-specific drafts directory. The renderer
+        # writes to ``.lattice/drafts/<voice>/cluster_<id>.md``; reading
+        # ``.lattice/drafts/`` directly always misses the marker scan.
+        drafts_root = lattice_dir / "drafts"
+        voice_drafts_dir: Path | None = None
+        if voice:
+            candidate = drafts_root / voice
+            if candidate.exists() and candidate.is_dir():
+                voice_drafts_dir = candidate
+        elif drafts_root.exists():
+            try:
+                for sub in sorted(drafts_root.iterdir()):
+                    if sub.is_dir() and any(sub.glob("cluster_*.md")):
+                        voice_drafts_dir = sub
+                        break
+            except OSError:
+                pass
+
         candidate_inputs = [
             lattice_dir / "author_graph.json",
             lattice_dir / "cluster_plan.json",
@@ -1527,6 +2116,16 @@ def create_app(projects_root: Path | None = None) -> FastAPI:
         if audit_dir.exists():
             try:
                 candidate_inputs.extend(p for p in audit_dir.iterdir() if p.is_file())
+            except OSError:
+                pass
+        # And every rendered cluster in the resolved voice directory,
+        # so re-rendering invalidates the cached marker scan.
+        if voice_drafts_dir is not None:
+            try:
+                candidate_inputs.extend(
+                    p for p in voice_drafts_dir.iterdir()
+                    if p.is_file() and p.suffix == ".md"
+                )
             except OSError:
                 pass
 
@@ -1593,13 +2192,13 @@ def create_app(projects_root: Path | None = None) -> FastAPI:
             except OSError:
                 pass
 
-            drafts_dir = lattice_dir / "drafts"
             html_str = _render_html(
                 graph,
                 clusters=clusters,
-                drafts_dir=drafts_dir if drafts_dir.exists() else None,
+                drafts_dir=voice_drafts_dir,
                 audit_flags_by_cluster=audit_flags_by_cluster or None,
                 readiness_blocking_clusters=blocking or None,
+                cytoscape_url="/static/vendor/cytoscape/cytoscape.min.js",
             )
             viz_path.parent.mkdir(parents=True, exist_ok=True)
             viz_path.write_text(version_stamp + "\n" + html_str, encoding="utf-8")
